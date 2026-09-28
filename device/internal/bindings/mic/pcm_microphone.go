@@ -36,6 +36,12 @@ const awbDevice = 7
 // disk, which release firmware must be unable to do.
 var rawTap func([]byte)
 
+// awbTap receives every batch of the Dot 3's speaker loopback (DL1_AWB_Record,
+// 2 ch S16 48 kHz — exactly what DL1 is playing), and is nil in release
+// builds. Only awbtap_bench.go sets it (build tag bench), to record what
+// reached the speaker when diagnosing playback artefacts.
+var awbTap func([]byte)
+
 // PcmMicrophone opens the ALSA device once and fans out to multiple subscribers.
 // Callers register via Listen(); each gets their own buffered channel.
 type PcmMicrophone struct {
@@ -324,7 +330,10 @@ func startClockAnchor() {
 	}()
 	go func() {
 		first := true
-		for range stream { // drain forever; an overrun would stop the stream
+		for b := range stream { // drain forever; an overrun would stop the stream
+			if awbTap != nil {
+				awbTap(b)
+			}
 			if first {
 				close(ready)
 				first = false
