@@ -1253,6 +1253,19 @@ on the software tap without being told. **The mic geometry is unmeasured**:
 ch3-as-centre and ch0-2 at 0/120/240° are what the first working firmware
 assumed. Measure it before trusting the direction overlay or beam locks.
 
+**The repacker also high-passes the capture at 150 Hz** (`mic/highpass.go`,
+4th-order Butterworth, per channel, state carried across reads). The Dot 3's
+mic noise is mostly mains hum: ch3 idle, USB unplugged, measured −62.3 dBFS
+total with −63.4 in the 100 Hz bin alone, against −70.2 for 300 Hz–1 kHz and
+speech at about −45 (2026-09-28). A USB cable to a laptop on its charger
+raised the total to −51.7, so **measure noise with USB unplugged** or the
+ground loop is what gets measured. The filter gives −14.3 dB at 100 Hz and
+−0.4 dB at 200 Hz, and is flat from 300 Hz up, which is where the wake model
+and ASR listen. Each channel is filtered once and then copied to every slot
+it fills, and the output is clamped to 24 bits rather than wrapped. The Dot 2
+path is unfiltered: its noise was never measured to need it, and changing a
+working wake word's input across the fleet would need that measurement first.
+
 **Writes to DL1 must be whole periods** (`speaker/periodwriter.go`). The
 write loop wrote 1024-frame pieces; on biscuit that IS the period, on the Dot 3
 it is 768, so writes ended mid-period and DL1 skipped or replayed audio — a

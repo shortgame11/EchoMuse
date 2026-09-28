@@ -60,7 +60,8 @@ var donutSlot = [outChannels]int{
 // repacker turns each Dot 3 read into one biscuit-shaped batch of the same
 // number of frames. Owned by the read loop alone.
 type repacker struct {
-	tail []byte // a partial input frame carried to the next push
+	tail []byte    // a partial input frame carried to the next push
+	hp   *highpass // nil copies the samples unchanged (see highpass.go)
 }
 
 // push converts every whole frame in in (after any carried partial frame) and
@@ -94,17 +95,43 @@ func (r *repacker) push(in []byte, emit func([]byte)) {
 	}
 	out := make([]byte, n*outFrameBytes)
 	o := 0
+	conv := frame
+	if r.hp != nil {
+		conv = r.filteredFrame
+	}
 	if head != nil {
-		frame(out[:outFrameBytes], head)
+		conv(out[:outFrameBytes], head)
 		o = outFrameBytes
 	}
 	for f := 0; f < whole; f++ {
-		frame(out[o+f*outFrameBytes:o+(f+1)*outFrameBytes], in[f*donutFrameBytes:(f+1)*donutFrameBytes])
+		conv(out[o+f*outFrameBytes:o+(f+1)*outFrameBytes], in[f*donutFrameBytes:(f+1)*donutFrameBytes])
 	}
 	emit(out)
 }
 
-// frame converts one Dot 3 frame into one biscuit frame.
+// filteredFrame is frame with each Dot 3 channel high-passed ONCE, then
+// placed in every slot it fills — filtering per slot would advance a
+// channel's state twice per frame.
+func (r *repacker) filteredFrame(dst, src []byte) {
+	var y [donutChannels]int32
+	for ch := range y {
+		i := ch * donutSampleSize
+		// Top three bytes, sign-extended: the 24-bit left-justified sample.
+		x := int32(uint32(src[i+1])<<8|uint32(src[i+2])<<16|uint32(src[i+3])<<24) >> 8
+		y[ch] = r.hp.sample(ch, x)
+	}
+	for slot, ch := range donutSlot {
+		o := slot * outSampleSize
+		if ch < 0 {
+			dst[o], dst[o+1], dst[o+2] = 0, 0, 0
+			continue
+		}
+		v := uint32(y[ch])
+		dst[o], dst[o+1], dst[o+2] = byte(v), byte(v>>8), byte(v>>16)
+	}
+}
+
+// frame converts one Dot 3 frame into one biscuit frame, unfiltered.
 func frame(dst, src []byte) {
 	for slot, ch := range donutSlot {
 		o := slot * outSampleSize

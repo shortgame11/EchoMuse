@@ -166,9 +166,10 @@ func (p *PcmMicrophone) readLoop() {
 	)
 
 	// On the Dot 3 each read goes through the repacker first, which hands
-	// deliver one biscuit-shaped batch per read, same frame count; elsewhere
-	// deliver sees the read as-is.
-	var rp repacker
+	// deliver one biscuit-shaped batch per read, same frame count, with the
+	// mains hum filtered out (highpass.go); elsewhere deliver sees the read
+	// as-is.
+	rp := repacker{hp: newDonutHighpass()}
 	deliver := func(audio []byte) {
 		now := time.Now()
 		frames := int64(len(audio) / bytesPerFrame)
