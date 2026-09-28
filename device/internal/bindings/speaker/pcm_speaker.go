@@ -67,6 +67,8 @@ var silencePeriod = make([]byte, periodBytes)
 
 type PcmSpeaker struct {
 	session *tinyalsa.AudioSession
+	// pw writes to ALSA in whole hardware periods; see periodwriter.go.
+	pw *periodWriter
 	stopCh  chan struct{}
 	// jackInserted is the plug position last applied by SetJackRouting, and
 	// jackKnown says whether one has been applied at all. The reconcile loop
@@ -236,6 +238,7 @@ func (p *PcmSpeaker) Init() error {
 		return err
 	}
 	p.session = &session
+	p.pw = newPeriodWriter(int(cfg.PeriodSize) * 4) // stereo S16
 
 	go p.silenceLoop()
 
@@ -537,19 +540,12 @@ var outTap func([]byte)
 
 // pump writes one mixed period to ALSA in hardware-period pieces, so the
 // buffer is topped up a hardware period at a time rather than waiting for
-// room for the whole mixed period — which would let it drain to half.
+// room for the whole mixed period — which would let it drain to half. The
+// pieces are the device's OWN period, whatever that is, carried across calls
+// when it does not divide the mixed period (periodwriter.go): the Dot 3's DL1
+// skipped and replayed audio on writes that ended mid-period.
 func (p *PcmSpeaker) pump(out []byte) error {
-	const chunk = alsaPeriodSize * 4 // stereo S16
-	for off := 0; off < len(out); off += chunk {
-		end := off + chunk
-		if end > len(out) {
-			end = len(out)
-		}
-		if err := p.session.Pump(out[off:end]); err != nil {
-			return err
-		}
-	}
-	return nil
+	return p.pw.write(out, p.session.Pump)
 }
 
 // report logs and forwards a completed stream's stats. A nil st is an

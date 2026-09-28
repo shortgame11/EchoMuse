@@ -1253,6 +1253,17 @@ on the software tap without being told. **The mic geometry is unmeasured**:
 ch3-as-centre and ch0-2 at 0/120/240° are what the first working firmware
 assumed. Measure it before trusting the direction overlay or beam locks.
 
+**Writes to DL1 must be whole periods** (`speaker/periodwriter.go`). The
+write loop wrote 1024-frame pieces; on biscuit that IS the period, on the Dot 3
+it is 768, so writes ended mid-period and DL1 skipped or replayed audio — a
+click every 2-3s. Found by recording both sides at once with the bench taps
+(`speaker/outtap_bench.go`, `mic/awbtap_bench.go`, `EM_EXTRA_TAGS=bench`): the
+audio handed to ALSA had 0 glitches in 8s of a 1 kHz tone, the DL1 loopback of
+the same moment 12, each a ±16-sample phase jump (1024 mod 48) with no
+silence. tinyplay, which writes one period at a time, was clean. Do not open
+the card's other loopback (`AWB_Record`, pcm3c) while DL1 plays: it rebooted
+the Dot 3.
+
 Smaller, in `pcm_speaker.go`, Dot 3 only: device 6 at stock's 768-frame period
 but four of them, not stock's two (this loop writes 1024-frame halves, which
 left ~11ms of slack in stock's 1536-frame buffer);
