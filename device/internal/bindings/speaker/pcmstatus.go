@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/wilbowes/EchoMuse/pkg/board"
 )
 
 // The speaker is card 0 device 23; the mic is device 24. Here rather than in
@@ -11,6 +13,48 @@ import (
 // status-path test needs to pin these on the host.
 const cardNr = 0
 const deviceNr = 23
+
+// On the Echo Dot 3rd gen the speaker is DL1_Playback, device 6 (and the mic
+// TDM_Capture, device 1).
+const donutDeviceNr = 6
+
+// playbackDevice is the speaker's PCM device on a board. Anything not
+// positively the Dot 3 keeps biscuit's, as every build did before.
+func playbackDevice(b *board.Board) int {
+	if b == board.Donut {
+		return donutDeviceNr
+	}
+	return deviceNr
+}
+
+// dacUnity is the DAC digital volume's 0dB index. The DAC stays here while
+// audio is live and the user's volume is applied to the PCM (swvolume.go);
+// Init and Close still use the control to mute around amp and stream
+// changes. Here rather than in pcm_speaker.go so the host test can pin it;
+// the Echo Dot 3rd gen's is different — see unityVolume.
+const dacUnity = "127"
+
+// unityVolume is the "PCM Playback Volume" value for 0dB, where the hardware
+// sits while the user's volume is applied in software (swvolume.go).
+//
+// On biscuit that control is the DAC's digital volume, 0..127 with 127 = 0dB.
+// On the Echo Dot 3rd gen the same NAME is the TAS2770 amp's digital volume,
+// INVERTED and wider: 0..255 with 255 = 0dB, -0.5dB a step, 0 = mute
+// (measured 2026-09-28: 255 reads back as amp register 0x05 = 0x00). So
+// biscuit's 127 there is -64dB, which is near silence at every volume.
+func unityVolume(b *board.Board) string {
+	if b == board.Donut {
+		return "255"
+	}
+	return dacUnity
+}
+
+// jackRoutingApplies reports whether the jack reconciler has anything to do.
+// Its two controls (the internal amp switch and the HP driver gain) are
+// biscuit's codec; the Dot 3's card has neither, and its line-out routing has
+// not been measured, so there it does nothing rather than rewrite controls
+// that do not exist every 30s.
+func jackRoutingApplies(b *board.Board) bool { return b != board.Donut }
 
 // The playback substream's status file, which is how we find out whether
 // anyone else holds the speaker BEFORE trying to open it.

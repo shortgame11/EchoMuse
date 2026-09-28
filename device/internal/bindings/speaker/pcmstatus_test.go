@@ -1,6 +1,10 @@
 package speaker
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/wilbowes/EchoMuse/pkg/board"
+)
 
 // Verbatim from Test Device (G090LF1180570SPJ) 2026-08-09, while Android's
 // mediaserver held the speaker and the server was stranded in snd_pcm_open.
@@ -74,5 +78,33 @@ func TestStatusPathMatchesTheDeviceWeOpen(t *testing.T) {
 	want := "/proc/asound/card0/pcm23p/sub0/status"
 	if got := statusPath(cardNr, deviceNr); got != want {
 		t.Fatalf("statusPath = %q, want %q", got, want)
+	}
+}
+
+func TestEachBoardOpensItsOwnSpeaker(t *testing.T) {
+	for _, c := range []struct {
+		b      *board.Board
+		dev    int
+		unity  string
+		jack   bool
+		status string
+	}{
+		{nil, 23, "127", true, "/proc/asound/card0/pcm23p/sub0/status"},
+		{board.Biscuit, 23, "127", true, "/proc/asound/card0/pcm23p/sub0/status"},
+		{board.Donut, 6, "255", false, "/proc/asound/card0/pcm6p/sub0/status"},
+	} {
+		id := board.IDOf(c.b)
+		if got := playbackDevice(c.b); got != c.dev {
+			t.Errorf("%s: playback device %d, want %d", id, got, c.dev)
+		}
+		if got := statusPath(cardNr, playbackDevice(c.b)); got != c.status {
+			t.Errorf("%s: status path %q, want %q", id, got, c.status)
+		}
+		if got := unityVolume(c.b); got != c.unity {
+			t.Errorf("%s: unity volume %q, want %q", id, got, c.unity)
+		}
+		if got := jackRoutingApplies(c.b); got != c.jack {
+			t.Errorf("%s: jack routing %v, want %v", id, got, c.jack)
+		}
 	}
 }

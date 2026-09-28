@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/wilbowes/EchoMuse/internal/bindings/codec"
 	"github.com/wilbowes/EchoMuse/internal/bindings/mixer"
 	"github.com/wilbowes/EchoMuse/internal/outchain"
+	"github.com/wilbowes/EchoMuse/pkg/board"
 
 	"github.com/Binozo/GoTinyAlsa/pkg/pcm"
 	"github.com/Binozo/GoTinyAlsa/pkg/tinyalsa"
@@ -186,7 +188,9 @@ func (p *PcmSpeaker) Init() error {
 	// device where EchoMuse drives the codec directly, mediaserver has no
 	// work to do and is only ever in the way.
 	exec.Command("stop", "media").Run()
-	waitForFreePcm(cardNr, deviceNr, pcmFreeTimeout)
+	donut := board.IsDonut()
+	dev := playbackDevice(board.Current())
+	waitForFreePcm(cardNr, dev, pcmFreeTimeout)
 	// Connect the DAC to the output mixer before opening the stream: DAPM
 	// decides what to power at stream open, and an unrouted DAC is powered
 	// down, which presents as a clean "voice stream complete, underruns=0"
@@ -194,7 +198,7 @@ func (p *PcmSpeaker) Init() error {
 	codec.EnsureRoutes()
 	mixer.Set(mixer.PlaybackVolume, "0") // mute before touching amp or stream
 
-	device := tinyalsa.NewDevice(cardNr, deviceNr, pcm.Config{
+	cfg := pcm.Config{
 		Channels:         2,
 		SampleRate:       48000,
 		PeriodSize:       alsaPeriodSize,
@@ -203,7 +207,23 @@ func (p *PcmSpeaker) Init() error {
 		StartThreshold:   alsaPeriodSize,
 		StopThreshold:    alsaBufferFrames,
 		SilenceThreshold: alsaBufferFrames,
-	})
+	}
+	if donut {
+		// Echo Dot 3rd gen: stock's routing for the TAS2770 path, in place
+		// BEFORE the stream starts — the amp is powered only if its path is
+		// connected at stream start. Values read off a stock Dot 3 playing.
+		mixer.Set("Audio Amp Playback Volume", "0")
+		mixer.Set("Headset_PGAL_GAIN", "-2dB")
+		mixer.Set("Headset_PGAR_GAIN", "-2dB")
+		mixer.Set("LINEOUT Mux", "VOICE_AMP")
+		waitForCaptureClocks()
+		// The period the first working Dot 3 firmware opened DL1 with, and
+		// every manual test on that board (tinyplay -p 768 -n 2).
+		cfg.PeriodSize, cfg.PeriodCount = 768, 2
+		cfg.StartThreshold, cfg.StopThreshold, cfg.SilenceThreshold = 768, 1536, 1536
+	}
+
+	device := tinyalsa.NewDevice(cardNr, dev, cfg)
 
 	session, err := device.NewAudioSession()
 	if err != nil {
@@ -213,13 +233,54 @@ func (p *PcmSpeaker) Init() error {
 
 	go p.silenceLoop()
 
-	time.Sleep(100 * time.Millisecond)     // silence reaches the DAC (~2 periods)
-	mixer.Set(mixer.SpeakerAmp, "On")      // enable amp onto a clocked, silent DAC
-	time.Sleep(50 * time.Millisecond)      // let amp settle
-	mixer.Set(mixer.PlaybackVolume, dacUnity) // unmute: volume is applied in software
+	time.Sleep(100 * time.Millisecond) // silence reaches the DAC (~2 periods)
+	if !donut {
+		mixer.Set(mixer.SpeakerAmp, "On") // enable amp onto a clocked, silent DAC
+		time.Sleep(50 * time.Millisecond) // let amp settle
+	}
+	// Unmute: volume is applied in software, so the hardware sits at 0dB.
+	mixer.Set(mixer.PlaybackVolume, unityVolume(board.Current()))
 
-	log.Println("PcmSpeaker initialised — silence stream running")
+	log.Printf("PcmSpeaker initialised on pcm%dp (%s) — silence stream running",
+		dev, board.IDOf(board.Current()))
 	return nil
+}
+
+// waitForCaptureClocks holds the speaker open until the mic capture and the
+// 48 kHz clock anchor (DL1_AWB_Record) are both running. Echo Dot 3rd gen only.
+//
+// The speaker's I2S port shares its clock with the TDM mic capture, and the
+// port's clock settings are fixed when the speaker stream is opened. Opened
+// while the capture side is still starting, it can run with invalid clocks for
+// its whole lifetime: the TAS2770 latches a TDM clock error and stays in
+// shutdown. Amazon's mixer and every working manual test had both captures
+// running before the speaker opened, and this keeps that order. On its own it
+// did not fix the silent speaker (the gpio444 export did — see led
+// mute_button.go), but it matches stock and costs a few hundred ms at start.
+//
+// The mic starts its capture on a goroutine, so being created first in main is
+// not enough.
+func waitForCaptureClocks() {
+	info, err := os.ReadFile("/proc/asound/card0/pcm7c/info")
+	if err != nil || !strings.Contains(string(info), "DL1_AWB_Record") {
+		return
+	}
+	running := func(path string) bool {
+		b, err := os.ReadFile(path)
+		return err == nil && strings.Contains(string(b), "state: RUNNING")
+	}
+	const mic = "/proc/asound/card0/pcm1c/sub0/status"
+	const awb = "/proc/asound/card0/pcm7c/sub0/status"
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if running(mic) && running(awb) {
+			time.Sleep(300 * time.Millisecond) // let the shared clock settle
+			log.Println("[speaker] mic and clock anchor running — opening speaker")
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	log.Println("[speaker] mic/clock anchor not running after 5s — opening speaker anyway")
 }
 
 // pcmFreeTimeout bounds the wait for another process to release the speaker.
@@ -283,6 +344,9 @@ func waitForFreePcm(card, device int, timeout time.Duration) {
 //     until someone unplugged and replugged — which is exactly why replugging
 //     was the folk remedy. It manufactures the edge the boot never had.
 func (p *PcmSpeaker) SetJackRouting(inserted bool) {
+	if !jackRoutingApplies(board.Current()) {
+		return
+	}
 	p.jackMu.Lock()
 	p.jackInserted = inserted
 	p.jackKnown = true
@@ -318,6 +382,9 @@ const JackReconcileInterval = 30 * time.Second
 // jack.Watch has run there is no desired state, and guessing one would fight
 // whatever Init established.
 func (p *PcmSpeaker) ReconcileJackRouting() int {
+	if !jackRoutingApplies(board.Current()) {
+		return 0
+	}
 	p.jackMu.Lock()
 	inserted, known := p.jackInserted, p.jackKnown
 	p.jackMu.Unlock()
@@ -642,11 +709,6 @@ func (p *PcmSpeaker) Flush() { p.voice.flush() }
 // non-seekable stream that audio cannot be recovered.
 func (p *PcmSpeaker) FlushMusic() { p.music.flush() }
 
-// dacUnity is the DAC digital volume's 0dB index. The DAC stays here while
-// audio is live and the user's volume is applied to the PCM (swvolume.go);
-// Init and Close still use the control to mute around amp and stream
-// changes.
-const dacUnity = "127"
 
 // SetVolume sets the playback volume as a device level (0..127, 0.5dB per
 // step, unity at 127). Takes effect from the next period, ramped across it.
@@ -661,7 +723,11 @@ func (p *PcmSpeaker) SetVolume(level int) { p.vol.set(VolumeGain(level)) }
 // this never runs (SIGKILL, panic).
 func (p *PcmSpeaker) Close() {
 	mixer.Set(mixer.PlaybackVolume, "0") // mute
-	mixer.Set(mixer.SpeakerAmp, "Off")   // amp off
+	if !board.IsDonut() {
+		// The Dot 3 has no amp switch; its amp powers down with the stream,
+		// and the routing is left in place for the next Init.
+		mixer.Set(mixer.SpeakerAmp, "Off") // amp off
+	}
 	close(p.stopCh)
 	p.session.Close()
 	log.Println("PcmSpeaker closed — output muted, amp off")

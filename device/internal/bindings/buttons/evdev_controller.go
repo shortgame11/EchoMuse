@@ -3,14 +3,44 @@ package buttons
 import (
 	"context"
 	"errors"
-	"time"
-	"github.com/wilbowes/EchoMuse/pkg/buttons"
-	evdev "github.com/gvalkov/golang-evdev"
 	"os/exec"
+	"time"
+
+	evdev "github.com/gvalkov/golang-evdev"
+	"github.com/wilbowes/EchoMuse/pkg/board"
+	"github.com/wilbowes/EchoMuse/pkg/buttons"
 )
 
+// The input devices the keys arrive on, which differ per board:
+//
+//	biscuit:  event1 = action (dot) + mute,  event2 = volume up/down
+//	Dot 3:    event3 = action + volume,      event1 = mute (privacy)
+//
+// What a key MEANS comes from its key code (buttonTypeOf), never from which
+// device carried it, so one loop serves both layouts. Anything not positively
+// the Dot 3 keeps biscuit's devices, as every build did before.
 const dotButton = "/dev/input/event1"
 const volumeButton = "/dev/input/event2"
+
+const donutKeysButton = "/dev/input/event3"
+const donutPrivacyButton = "/dev/input/event1"
+
+func buttonDevices(b *board.Board) []string {
+	if b == board.Donut {
+		return []string{donutKeysButton, donutPrivacyButton}
+	}
+	return []string{dotButton, volumeButton}
+}
+
+// buttonTypeOf is the button a key code belongs to: the volume keys are the
+// volume button, everything else (action, mute) the dot button — biscuit's
+// device split, expressed by code.
+func buttonTypeOf(c buttons.ClickType) buttons.ButtonType {
+	if c == buttons.VolumeUpClick || c == buttons.VolumeDownClick {
+		return buttons.VolumeButton
+	}
+	return buttons.DotButton
+}
 
 // VolumeCallback is called on volume button release with direction "up" or "down".
 type VolumeCallback func(direction string)
@@ -38,7 +68,11 @@ func (e *EvDevController) SetMuteCallback(cb func()) {
 // Init the button listeners
 // Kills alexa's native button functions
 func (e *EvDevController) Init() error {
-	cmd := exec.Command("stop", "acebutton")
+	svc := "acebutton"
+	if board.IsDonut() {
+		svc = "acebuttond" // the Dot 3's name for Amazon's button daemon
+	}
+	cmd := exec.Command("stop", svc)
 	return cmd.Run()
 }
 
@@ -47,21 +81,22 @@ func (e *EvDevController) SubscribeToButton(callback buttons.ButtonClickCallback
 		return nil, errors.New("callback can't be nil")
 	}
 
-	dotBtn := e.GetDotButton()
-	volBtn := e.GetVolumeButton()
-	dotDevice, err := evdev.Open(dotButton)
-	if err != nil {
-		return nil, err
-	}
-	volDevice, err := evdev.Open(volumeButton)
-	if err != nil {
-		return nil, err
+	var devices []*evdev.InputDevice
+	for _, path := range buttonDevices(board.Current()) {
+		d, err := evdev.Open(path)
+		if err != nil {
+			for _, open := range devices {
+				open.Release()
+			}
+			return nil, err
+		}
+		devices = append(devices, d)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	eventSub := buttons.NewEventSubscription(cancel)
 
-	readBtn := func(btn buttons.Button, btnDevice *evdev.InputDevice) {
+	readBtn := func(btnDevice *evdev.InputDevice) {
 		defer btnDevice.Release()
 
 		beforeClickType := buttons.ClickType(0)
@@ -110,7 +145,9 @@ func (e *EvDevController) SubscribeToButton(callback buttons.ButtonClickCallback
 			}
 			beforeDown = down
 
-			// Intercept volume events on volume device
+			btn := buttons.Button{Type: buttonTypeOf(clickType)}
+
+			// Intercept volume events
 			if btn.Type == buttons.VolumeButton && !down {
 				switch clickType {
 				case buttons.VolumeUpClick:
@@ -125,7 +162,7 @@ func (e *EvDevController) SubscribeToButton(callback buttons.ButtonClickCallback
 				continue
 			}
 
-			// Intercept mute on dot device
+			// Intercept mute
 			if btn.Type == buttons.DotButton && !down && clickType == buttons.MuteClick {
 				if e.muteCallback != nil {
 					e.muteCallback()
@@ -150,8 +187,9 @@ func (e *EvDevController) SubscribeToButton(callback buttons.ButtonClickCallback
 		}
 	}
 
-	go readBtn(dotBtn, dotDevice)
-	go readBtn(volBtn, volDevice)
+	for _, d := range devices {
+		go readBtn(d)
+	}
 
 	return eventSub, nil
 }

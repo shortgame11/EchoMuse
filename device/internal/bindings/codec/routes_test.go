@@ -1,6 +1,11 @@
 package codec
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"github.com/wilbowes/EchoMuse/pkg/board"
+)
 
 // A wrong name here is silence rather than an error, and the two ends failed
 // independently: the capture routes leave the ADCs powered down, the playback
@@ -41,6 +46,32 @@ func TestRoutesCoverBothEndsOfTheAudioPath(t *testing.T) {
 	for name := range got {
 		if !want[name] {
 			t.Errorf("unexpected %s", name)
+		}
+	}
+}
+
+func TestEachBoardGetsItsOwnRoutes(t *testing.T) {
+	if got := routesFor(nil); &got[0] != &Routes[0] {
+		t.Error("an unidentified board must keep biscuit's routes")
+	}
+	if got := routesFor(board.Biscuit); &got[0] != &Routes[0] {
+		t.Error("biscuit must get Routes")
+	}
+	if got := routesFor(board.Donut); &got[0] != &DonutRoutes[0] {
+		t.Error("the Dot 3 must get DonutRoutes")
+	}
+	// The two tables must not share a playback route: biscuit's HP mixer
+	// switches do not exist on the Dot 3's card, and the reverse.
+	seen := map[string]bool{}
+	for _, w := range Routes {
+		seen[w.Name] = true
+	}
+	for _, w := range DonutRoutes {
+		if w.Value != "1" {
+			t.Errorf("%s: value %q, want \"1\"", w.Name, w.Value)
+		}
+		if seen[w.Name] && !strings.HasPrefix(w.Name, "ADC_") {
+			t.Errorf("%s is in both tables", w.Name)
 		}
 	}
 }

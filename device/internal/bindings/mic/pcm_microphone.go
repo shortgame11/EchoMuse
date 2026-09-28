@@ -6,18 +6,30 @@ import (
 	"context"
 	"errors"
 	"log"
+	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/wilbowes/EchoMuse/internal/bindings/codec"
+	"github.com/wilbowes/EchoMuse/pkg/board"
 	pkgmic "github.com/wilbowes/EchoMuse/pkg/mic"
 	"github.com/Binozo/GoTinyAlsa/pkg/pcm"
 	"github.com/Binozo/GoTinyAlsa/pkg/tinyalsa"
 )
 
 const cardNr = 0
-const deviceNr = 24
+const deviceNr = 24 // biscuit; the Dot 3's capture is donutDeviceNr
+
+// The Echo Dot 3rd gen's capture: TDM_Capture, 4 ch S32_LE, at the period the
+// first working firmware ran it with (256 x 10, measured on hardware
+// 2026-09-28). Reshaped to biscuit's layout by donut_repack.go.
+const donutDeviceNr = 1
+
+// The Dot 3's speaker loopback, DL1_AWB_Record — opened before the mic, see
+// startClockAnchor.
+const awbDevice = 7
 
 // rawTap receives every raw 9-channel batch, and is nil in release builds.
 // Only rawtap_bench.go sets it (build tag bench): it records the mics to
@@ -30,20 +42,39 @@ type PcmMicrophone struct {
 	device *tinyalsa.AlsaDevice
 	mu     sync.Mutex
 	subs   []chan []byte
+	// donut: the capture is the Dot 3's 4-channel S32 and every batch goes
+	// through a repacker before anyone sees it.
+	donut bool
 }
 
 // NewMicrophone returns the pre-configured microphone alsa device and starts
 // the permanent ALSA read loop.
 func NewMicrophone() (*PcmMicrophone, error) {
-	device := tinyalsa.NewDevice(cardNr, deviceNr, pcm.Config{
-		Channels:    9,
-		SampleRate:  16000,
-		PeriodSize:  512,
-		PeriodCount: 5,
-		Format:      tinyalsa.PCM_FORMAT_S24_3LE,
-	})
+	donut := board.IsDonut()
+	var device tinyalsa.AlsaDevice
+	if donut {
+		device = tinyalsa.NewDevice(cardNr, donutDeviceNr, pcm.Config{
+			Channels:         donutChannels,
+			SampleRate:       16000,
+			PeriodSize:       256,
+			PeriodCount:      10,
+			Format:           tinyalsa.PCM_FORMAT_S32_LE,
+			StartThreshold:   256,
+			StopThreshold:    2560,
+			SilenceThreshold: 2560,
+		})
+	} else {
+		device = tinyalsa.NewDevice(cardNr, deviceNr, pcm.Config{
+			Channels:    9,
+			SampleRate:  16000,
+			PeriodSize:  512,
+			PeriodCount: 5,
+			Format:      tinyalsa.PCM_FORMAT_S24_3LE,
+		})
+	}
 	m := &PcmMicrophone{
 		device: &device,
+		donut:  donut,
 	}
 	if err := m.Init(); err != nil {
 		return nil, err
@@ -57,6 +88,9 @@ func (p *PcmMicrophone) Init() error {
 	cmd := exec.Command("stop", "mixer")
 	if err := cmd.Run(); err != nil {
 		log.Printf("mic: stop mixer: %v (continuing)", err)
+	}
+	if p.donut {
+		startClockAnchor()
 	}
 	// Route the differential mic inputs into the ADCs before opening the PCM.
 	// Without this the ADCs are powered down and capture returns the I2S bus's
@@ -111,7 +145,11 @@ func (p *PcmMicrophone) readLoop() {
 	}()
 
 	rate := int64(p.device.DeviceConfig.SampleRate)
-	bytesPerFrame := p.device.DeviceConfig.Channels * 3 // S24_3LE
+	// Counted on what subscribers receive: biscuit's 9 x S24_3LE on both
+	// boards, since the Dot 3's capture is reshaped to it before this point.
+	// (Counting the Dot 3's raw S32 at 3 bytes a sample overstated its frames
+	// by 4/3 and read as a capture running fast.)
+	bytesPerFrame := outFrameBytes
 	var (
 		firstArrival time.Time
 		lastArrival  time.Time
@@ -121,7 +159,10 @@ func (p *PcmMicrophone) readLoop() {
 		subDrops     uint64
 	)
 
-	for audio := range stream {
+	// On the Dot 3 each driver period goes through the repacker, and deliver
+	// runs once per completed biscuit-shaped batch; elsewhere once per period.
+	var rp repacker
+	deliver := func(audio []byte) {
 		now := time.Now()
 		frames := int64(len(audio) / bytesPerFrame)
 		batchDur := time.Duration(frames) * time.Second / time.Duration(rate)
@@ -172,6 +213,14 @@ func (p *PcmMicrophone) readLoop() {
 			}
 		}
 		p.mu.Unlock()
+	}
+
+	for audio := range stream {
+		if p.donut {
+			rp.push(audio, deliver)
+		} else {
+			deliver(audio)
+		}
 	}
 
 	// Stream ended — close all subscriber channels so callers see EOF rather
@@ -232,5 +281,60 @@ func (p *PcmMicrophone) Listen(callback pkgmic.AudioCallback, ctx context.Contex
 			}
 			callback(audio)
 		}
+	}
+}
+
+// startClockAnchor holds DL1_AWB_Record (the speaker loopback, 48 kHz) open for
+// the life of the process, and is started BEFORE the mic. Echo Dot 3rd gen only.
+//
+// The TDM mic capture and the I2S port that feeds the TAS2770 speaker amp share
+// an audio clock. Opening the mic at 16 kHz with nothing else running
+// configures that clock so the speaker port cannot produce a valid 48 kHz
+// frame; the amp latches a TDM clock error (INT_LTCH0 bit 2) and shuts down,
+// and it stays that way until a reboot. Amazon's mixer avoids it by opening
+// this 48 kHz loopback first, from the same process, and so do we. Measured
+// 2026-09-28: mic alone at 16 kHz breaks the speaker; loopback first, then
+// mic, both work.
+//
+// Returns at once if device 7 is not DL1_AWB_Record, so a card laid out
+// differently is left alone.
+func startClockAnchor() {
+	info, err := os.ReadFile("/proc/asound/card0/pcm7c/info")
+	if err != nil || !strings.Contains(string(info), "DL1_AWB_Record") {
+		log.Printf("[mic] no DL1_AWB_Record on pcm7c — clock anchor not started")
+		return
+	}
+	dev := tinyalsa.NewDevice(cardNr, awbDevice, pcm.Config{
+		Channels:         2,
+		SampleRate:       48000,
+		PeriodSize:       768,
+		PeriodCount:      10,
+		Format:           tinyalsa.PCM_FORMAT_S16_LE,
+		StartThreshold:   768,
+		StopThreshold:    7680,
+		SilenceThreshold: 7680,
+	})
+	stream := make(chan []byte, 16)
+	ready := make(chan struct{})
+	go func() {
+		if err := dev.GetAudioStream(dev.DeviceConfig, stream); err != nil {
+			log.Printf("[mic] clock anchor (DL1_AWB_Record) stream error: %v", err)
+		}
+	}()
+	go func() {
+		first := true
+		for range stream { // drain forever; an overrun would stop the stream
+			if first {
+				close(ready)
+				first = false
+			}
+		}
+		log.Printf("[mic] clock anchor stream closed — speaker may lose its clock")
+	}()
+	select {
+	case <-ready:
+		log.Printf("[mic] clock anchor running (DL1_AWB_Record 48 kHz) — mic may open")
+	case <-time.After(2 * time.Second):
+		log.Printf("[mic] clock anchor did not start within 2s — opening mic anyway")
 	}
 }

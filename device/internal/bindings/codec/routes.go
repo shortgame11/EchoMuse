@@ -38,6 +38,7 @@ import (
 	"sync"
 
 	"github.com/wilbowes/EchoMuse/internal/bindings/mixer"
+	"github.com/wilbowes/EchoMuse/pkg/board"
 )
 
 // Write sets one mixer control, found by name.
@@ -75,6 +76,33 @@ var Routes = []Write{
 	{"HPL Output Mixer L_DAC Switch", "1"},
 }
 
+// DonutRoutes are the Echo Dot 3rd gen's (mt-snd-card) equivalents, as run
+// on hardware 2026-09-28. Capture: the differential inputs into ADC_A and
+// ADC_B, which carry the board's four mic channels. Playback: the memif
+// interconnect from the DL1 stream (I05/I06) through O03/O04 to the I2S port
+// that feeds the TAS2770 amp. biscuit's HP output-mixer switches do not exist
+// on this card, and writing them only fails.
+var DonutRoutes = []Write{
+	{"ADC_B Right Ip Select ADC_B DIF1_R switch", "1"},
+	{"ADC_B Left Ip Select ADC_B DIF1_L switch", "1"},
+	{"ADC_A Right Ip Select ADC_A DIF1_R switch", "1"},
+	{"ADC_A Left Ip Select ADC_A DIF1_L switch", "1"},
+	{"O03 I05 Switch", "1"},
+	{"O04 I06 Switch", "1"},
+	{"I2S O03_O04 Switch", "1"},
+	{"INT ADDA O03_O04 Switch", "1"},
+}
+
+// routesFor is the route table for a board. Anything that is not positively
+// the Dot 3 keeps biscuit's, which is what every build did before boards were
+// told apart.
+func routesFor(b *board.Board) []Write {
+	if b == board.Donut {
+		return DonutRoutes
+	}
+	return Routes
+}
+
 var once sync.Once
 
 // EnsureRoutes applies Routes exactly once per process.
@@ -87,17 +115,18 @@ var once sync.Once
 // whatever happens to hold that id on this kernel.
 func EnsureRoutes() {
 	once.Do(func() {
+		routes := routesFor(board.Current())
 		var failed int
-		for _, w := range Routes {
+		for _, w := range routes {
 			if err := mixer.Set(w.Name, w.Value); err != nil {
 				failed++
 			}
 		}
 		if failed > 0 {
 			log.Printf("[codec] %d of %d DAPM routes failed — audio may be silent",
-				failed, len(Routes))
+				failed, len(routes))
 		} else {
-			log.Printf("[codec] %d DAPM routes closed", len(Routes))
+			log.Printf("[codec] %d DAPM routes closed (%s)", len(routes), board.IDOf(board.Current()))
 		}
 	})
 }

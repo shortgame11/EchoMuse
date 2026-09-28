@@ -1169,9 +1169,20 @@ FireOS 6574.1 (Android 7.1.2), rooted with amonet + TWRP 3.7.0 +
 `boot-root.zip`, slot A. EchoMuse runs there with the wake word, speaker output
 and WiFi surviving cold boots. Provisioning is the wizard's third flow (see
 `controller/CLAUDE.md`); this section is the hardware and what the firmware must
-do differently on it. **The speaker fixes below are in the Dot 3 firmware
-changes, not on main as of `f53d14f`**, and they are gated on this board's
-hardware so biscuit is unaffected.
+do differently on it.
+
+**One binary serves both boards, and the switch is `pkg/board`.** `board.Donut`
+is identified by its TAS2770 amp found BY NAME at i2c `2-0044` (its idme device
+type id has not been read yet; add it to the board when it is, and idme will
+win). Every binding that differs asks `board.IsDonut()` / `board.Current()`,
+and **anything not positively the Dot 3 — an unknown board included — keeps
+biscuit's behaviour**, which is what every build did before boards were told
+apart. The per-board values live beside the code that uses them and are pinned
+by host tests in each package: routes (`codec.DonutRoutes`), the speaker's
+device, unity volume and jack routing (`speaker/pcmstatus.go`), the input
+devices (`buttons`), the LED paths (`led`), and the capture (`mic`). The first
+Dot 3 firmware REPLACED biscuit's values instead, which is why it could not
+run on a Dot 2.
 
 **It stays on FireOS; emOS's boot image cannot boot here.** The bootloader still
 verifies the boot image (`ro.boot.verifiedbootstate=yellow`: verified, against a
@@ -1205,9 +1216,8 @@ starved of valid clocks**, three different ways:
   not the lever. Stock's `mixer` opens the loopback (device 7) **before** the
   mic, from the same process; reproduced with `tinycap` in both orders. Fix:
   `startClockAnchor()` in `pcm_microphone.go` opens device 7 and drains it
-  forever, and the mic waits for its first batch. Gated on `pcm7c/info` naming
-  `DL1_AWB_Record`. Also fixed there: `bytesPerFrame` is `Channels * 4` (S32),
-  not `* 3`, which overcounted frames by 4/3 and faked a "capture fast" skew.
+  forever, and the mic waits for its first batch. Dot 3 only, and also gated
+  on `pcm7c/info` naming `DL1_AWB_Record`.
 - **`gpio444` is an audio pin on this board.** The mute-LED code exports
   sysfs `gpio444`, found on biscuit. Here the gpiochip base is 387, so 444 is
   **SoC pin 57**, which boots in its mode-4 audio function. Exporting it turns
@@ -1215,22 +1225,39 @@ starved of valid clocks**, three different ways:
   reboot. Read it in `/sys/devices/platform/soc/1000b000.pinctrl/mt_gpio`:
   `57: 4 0 0 1 …` clean, `57: 0 1 0 0 …` after EchoMuse. `unexport` plus
   `echo 'mode 57 4'` into that file restores sound without a reboot. Fix:
-  `mute_button.go` does nothing when the TAS2770 is present. **The Dot 3's real
+  `mute_button.go` does nothing on the Dot 3. **The Dot 3's real
   mute-LED pin is not yet known**, so the LED is not driven. This is the
   biscuit lesson again, one board later: a GPIO number is a property of one
   board, and the write that is wrong on the next one succeeds silently.
 - **Volume is the amp's digital volume, inverted.** `PCM Playback Volume` is
-  0–255 with 255 = 0 dB and −0.5 dB per step; the controller's 0–127 scale was
-  written straight through, so "normal" was about −77 dB. Fix (`volume.go`):
-  when `/sys/bus/i2c/devices/2-0044/name` is `tas2770`, write `level + 128`
-  (0 stays 0) and invert on read.
+  0–255 with 255 = 0 dB and −0.5 dB per step. The first Dot 3 firmware
+  predates the software volume (`speaker/swvolume.go`) and mapped the user's
+  level onto it (`level + 128`). Since that change the hardware only ever
+  sits at unity while audio is live, so the fix is just the unity value:
+  `unityVolume` is `255` on the Dot 3, where biscuit's `127` would be −64 dB.
 
-Smaller, in `pcm_speaker.go`: set stock's routing (`Audio Amp Playback Volume`
-0, `Headset_PGAL/R_GAIN` −2 dB, `LINEOUT Mux` `VOICE_AMP`) **before** opening
-the stream; drop `Playback State` (absent here); open the speaker only once
+**The capture is reshaped to biscuit's, so everything downstream is shared**
+(`mic/donut_repack.go`). The Dot 3 captures 4 ch S32_LE from TDM_Capture
+(device 1) at 256-frame periods; the beamformer, the AEC's hardware-reference
+check, the wake word and the data plane all read biscuit's 9 ch S24_3LE in
+512-frame batches. The repacker keeps the top 24 bits (the data is 24-bit,
+left-justified), fills biscuit's six perimeter directions from the NEAREST
+real mic so no fixed beam angle lands on a dead channel, puts the Dot 3's ch3
+on the centre channel that feeds the wake word, and leaves ch7/ch8 silent. A
+loopback that never carries audio is never confirmed as one, so the AEC stays
+on the software tap without being told. **The mic geometry is unmeasured**:
+ch3-as-centre and ch0-2 at 0/120/240° are what the first working firmware
+assumed. Measure it before trusting the direction overlay or beam locks.
+
+Smaller, in `pcm_speaker.go`, Dot 3 only: device 6 at stock's 768 x 2 period;
+stock's routing (`Audio Amp Playback Volume` 0, `Headset_PGAL/R_GAIN` −2 dB,
+`LINEOUT Mux` `VOICE_AMP`) set **before** opening the stream; open only once
 `pcm1c` and `pcm7c` are `RUNNING`, which matches stock's order (it did not by
-itself fix anything; pin 57 did); `Close()` mutes but no longer resets
-`LINEOUT Mux`; use `deviceNr`, not a hardcoded 6.
+itself fix anything; pin 57 did); no amp switch on or off (there is none);
+and the jack reconciler does nothing, since its two controls are biscuit's
+codec. Buttons: action and volume arrive on `event3`, mute on `event1`, and
+Amazon's daemon is `acebuttond`; a key's meaning comes from its code, so the
+one read loop serves both layouts.
 
 **Testing on this board:**
 
@@ -1268,12 +1295,12 @@ time here). WiFi has no framework in the loop once Alexa is off:
 `wpa_supplicant` sits at `INTERFACE_DISABLED` until something runs
 `ifconfig wlan0 up`, and DHCP is a `dhcpcd` service.
 
-**Open on this board:** the mute-LED pin; `assetmgrd` still starts from an
-unidentified trigger; the jack-routing reconciler's controls do not exist here
-and it logs "2 controls rewritten" every 30 s; host tests that pin biscuit
-values (routes, speaker device 23, the 9-channel beamformer) need a board
-switch rather than replaced values before any of this is upstream; and
-`DL1_AWB_Record` could replace the software AEC tap on this board.
+**Open on this board:** the mute-LED pin; the mic geometry; the idme device
+type id; line-out routing (the jack reconciler is off here); a thermal
+`Tuning` read off a stock Dot 3; `assetmgrd` still starts from an unidentified
+trigger; `start_server.sh` still writes biscuit's mixer controls and waits
+120 s for `echoaudio`; and `DL1_AWB_Record` could replace the software AEC tap
+on this board.
 
 ## Where the serial comes from
 

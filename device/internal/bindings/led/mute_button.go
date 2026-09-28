@@ -3,6 +3,8 @@ package led
 import (
 	"fmt"
 	"os"
+
+	"github.com/wilbowes/EchoMuse/pkg/board"
 )
 
 // Mute-button LED — the discrete red LED under the mic-off button, separate
@@ -16,6 +18,15 @@ import (
 // MSDC2_DAT1 and writes to gpio445 reach nothing (v2.9.4 and earlier drove
 // it; the button never lit). Stock itself bypasses sysfs via the /dev/mtgpio
 // ioctl, which is why the HAL constant never had to agree with gpiolib.
+//
+// NOT ON THE ECHO DOT 3RD GEN. There the gpiochip base is 387, so gpio444 is
+// SoC pin 57, and on that board pin 57 sits in its mode-4 audio function.
+// Exporting it through sysfs switches it to plain GPIO (and this code then
+// drives it low), which breaks the speaker's serial clocks: the TAS2770 amp
+// latches a TDM clock error and stays in shutdown until reboot. Measured
+// 2026-09-28: clean boot "57: 4 0 0 1 ...", after EchoMuse "57: 0 1 0 0 ...",
+// and silence from every playback path until the pin was restored. The Dot
+// 3's mute LED is not yet identified, so on that board it is not driven.
 const (
 	muteButtonGPIO      = "444"
 	gpioExportPath      = "/sys/class/gpio/export"
@@ -30,6 +41,9 @@ const (
 // On a kernel with Amazon's privacy driver the LED is the driver's
 // (privacy.go), so there is nothing to export.
 func InitMuteButtonLED() error {
+	if board.IsDonut() {
+		return nil // gpio444 is an audio pin there — see the const block
+	}
 	if PrivacyDriver() {
 		return nil
 	}
@@ -51,6 +65,9 @@ func InitMuteButtonLED() error {
 // does nothing: the button that unmuted us has already taken the driver out,
 // and nothing else can.
 func SetMuteButtonLED(on bool) error {
+	if board.IsDonut() {
+		return nil
+	}
 	if PrivacyDriver() {
 		if !on {
 			return nil

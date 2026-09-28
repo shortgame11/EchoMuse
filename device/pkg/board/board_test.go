@@ -53,6 +53,51 @@ func TestNoIdmeIsNoBoard(t *testing.T) {
 	}
 }
 
+func TestDonutIsIdentifiedByItsAmp(t *testing.T) {
+	amp := "/sys/bus/i2c/devices/2-0044/name"
+	for name, want := range map[string]*Board{
+		"tas2770\n": Donut,
+		"tas2770":   Donut,
+		"tas2781\n": nil, // a different part is not this board
+		"":          nil,
+	} {
+		if got := Detect(mkroot(t, map[string]string{amp: name})); got != want {
+			t.Errorf("amp %q: Detect = %v, want %v", name, IDOf(got), IDOf(want))
+		}
+	}
+	// No i2c client at all — biscuit, or anything else — is not a Dot 3.
+	if got := Detect(t.TempDir()); got != nil {
+		t.Errorf("empty root: Detect = %v, want nil", IDOf(got))
+	}
+}
+
+func TestIdmeWinsOverAProbe(t *testing.T) {
+	// A biscuit id is biscuit whatever else is on the bus.
+	root := mkroot(t, map[string]string{
+		"/proc/idme/device_type_id":        "A3S5BH2HU6VAYF\x00",
+		"/sys/bus/i2c/devices/2-0044/name": "tas2770\n",
+	})
+	if got := Detect(root); got != Biscuit {
+		t.Fatalf("Detect = %v, want biscuit", IDOf(got))
+	}
+}
+
+func TestAnUnknownIdmeFallsThroughToProbes(t *testing.T) {
+	// The Dot 3's own device type id is not in the table, so its idme must not
+	// stop the amp probe from answering.
+	root := mkroot(t, map[string]string{
+		"/proc/idme/device_type_id":        "ANOTHERTYPEID\x00",
+		"/sys/bus/i2c/devices/2-0044/name": "tas2770\n",
+	})
+	if got := Detect(root); got != Donut {
+		t.Fatalf("Detect = %v, want donut", IDOf(got))
+	}
+	// And an empty DeviceTypeID never matches an empty idme.
+	if got := Detect(mkroot(t, map[string]string{"/proc/idme/device_type_id": ""})); got != nil {
+		t.Fatalf("empty idme: Detect = %v, want nil", IDOf(got))
+	}
+}
+
 // thermalRoot builds a sysfs tree with the given zone and cooler types.
 func thermalRoot(t *testing.T, zones, coolers []string, extra map[string]string) string {
 	files := map[string]string{}

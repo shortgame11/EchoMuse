@@ -7,23 +7,25 @@ import (
 	"github.com/wilbowes/EchoMuse/pkg/led"
 	"os"
 	"os/exec"
+
+	"github.com/wilbowes/EchoMuse/pkg/board"
 )
 
 // i2C device that sets the current led
-const ledCurrentPath = "/sys/devices/soc/11007000.i2c/i2c-0/0-003f/led_current"
+var ledCurrentPath = ledPath("/sys/devices/soc/11007000.i2c/i2c-0/0-003f/led_current", "led_current")
 
 // i2C device that seems to control brightness
-const privacyBrightnessPath = "/sys/devices/soc/10010000.keypad/amz_privacy/privacy_brightness"
+var privacyBrightnessPath = ledPath("/sys/devices/soc/10010000.keypad/amz_privacy/privacy_brightness", "privacy_brightness")
 
 // i2C device that controls the actual LEDs
-const ledFrame = "/sys/devices/soc/11007000.i2c/i2c-0/0-003f/frame"
+var ledFrame = ledPath("/sys/devices/soc/11007000.i2c/i2c-0/0-003f/frame", "frame")
 
 // The is31fl3236 driver animates the ring itself from boot until something
 // clears this. Android's userspace does; ours does not, so on a device running
 // our own init the kernel animation and our frames drive the same LEDs over the
 // same i2C device and the ring visibly glitches. Reads 1 under our userspace and
 // 0 on stock.
-const bootAnimationPath = "/sys/devices/soc/11007000.i2c/i2c-0/0-003f/boot_animation"
+var bootAnimationPath = ledPath("/sys/devices/soc/11007000.i2c/i2c-0/0-003f/boot_animation", "boot_animation")
 
 // file permission we need to access the i2C device
 const perm = os.FileMode(0644)
@@ -114,4 +116,19 @@ func NewDefaultController() (led.Controller, error) {
 	}
 
 	return controller, nil
+}
+
+// donutLEDDir is the ring driver's i2c client on the Echo Dot 3rd gen: the same
+// is31fl3236 at 0-003f as biscuit, reached by its bus path because the SoC
+// path differs. The privacy (mute-button) brightness is also here on that
+// board, where biscuit has it under the keypad's amz_privacy node.
+const donutLEDDir = "/sys/bus/i2c/devices/0-003f/"
+
+// ledPath is biscuit's path, or the Dot 3's for the same attribute. Anything
+// not positively the Dot 3 keeps biscuit's paths, as every build did before.
+func ledPath(biscuit, attr string) string {
+	if board.IsDonut() {
+		return donutLEDDir + attr
+	}
+	return biscuit
 }
