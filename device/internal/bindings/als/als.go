@@ -44,6 +44,7 @@ package als
 import (
 	"context"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -54,6 +55,24 @@ import (
 
 // driverName is the sysfs `name` of the sensor that has a usable interface.
 const driverName = "tsl2540"
+
+// iioSensors are ambient light sensors reached through the kernel's IIO
+// subsystem, by the device's IIO `name`, with the attribute that holds lux.
+// Looked at only when biscuit's tsl2540 is not found, so biscuit is unchanged.
+//
+// tsl2572 is the Echo Dot 3rd gen's sensor. Its i2c node (0-0039) has no
+// als_lux; the reading is the standard IIO in_illuminance0_input, in lux as a
+// decimal ("56.973000"), and it reads 0.000000 when covered (measured
+// 2026-09-28). The bus also lists an opt3001 at 0-0044 with no driver bound
+// and no IIO device: declared by the board file, not fitted — the same shape
+// as biscuit's tsl2584 (#90), and why these are matched by what has a
+// readable attribute, not by what the bus lists.
+var iioSensors = map[string]string{
+	"tsl2572": "in_illuminance0_input",
+}
+
+// iioGlob is where IIO devices are enumerated; a variable only for the tests.
+var iioGlob = "/sys/bus/iio/devices/*/name"
 
 // RetryInterval bounds how often an unresolved sensor is looked for again.
 // The scan is a glob plus a handful of small sysfs reads, so this is about
@@ -182,6 +201,29 @@ func resolve() string {
 			found = p
 		}
 	}
+	if found == "" {
+		// Not biscuit's sensor: try the IIO ones, by name. Their names join
+		// Seen as "iio:<name>", so a bus with neither shows everything that
+		// was looked at.
+		if iio, err := filepath.Glob(iioGlob); err == nil {
+			for _, n := range iio {
+				b, err := os.ReadFile(n)
+				if err != nil {
+					continue
+				}
+				got := strings.TrimSpace(string(b))
+				seen = append(seen, "iio:"+got)
+				attr, ok := iioSensors[got]
+				if !ok || found != "" {
+					continue
+				}
+				p := filepath.Join(filepath.Dir(n), attr)
+				if _, err := os.Stat(p); err == nil {
+					found = p
+				}
+			}
+		}
+	}
 	if found != "" {
 		path = found
 		status = Status{Code: StatusOK, Path: found, Seen: seen}
@@ -200,7 +242,7 @@ func resolve() string {
 	} else {
 		status = Status{
 			Code:   StatusNoChip,
-			Detail: "no " + driverName + " on the i2c bus — this hardware revision appears not to have the sensor fitted",
+			Detail: "no " + driverName + " on the i2c bus and no known IIO light sensor — this hardware revision appears not to have the sensor fitted",
 			Seen:   seen,
 		}
 	}
@@ -255,11 +297,22 @@ func Lux() *int {
 	if err != nil {
 		return nil
 	}
-	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
-	if err != nil {
+	n, ok := parseLux(string(b))
+	if !ok {
 		return nil
 	}
 	return &n
+}
+
+// parseLux reads a lux attribute: an integer (biscuit's als_lux, "309") or an
+// IIO decimal (the Dot 3's in_illuminance0_input, "56.973000"), rounded to
+// whole lux. Negative or non-finite values are not readings.
+func parseLux(s string) (int, bool) {
+	f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil || f < 0 || math.IsInf(f, 0) || math.IsNaN(f) {
+		return 0, false
+	}
+	return int(math.Round(f)), true
 }
 
 // ── Change watching ──────────────────────────────────────────────────────────

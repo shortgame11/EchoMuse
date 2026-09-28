@@ -95,10 +95,12 @@ func fakeBus(t *testing.T, devices map[string]bool) {
 	status = Status{Code: StatusUnknown}
 	mu.Unlock()
 
-	old := i2cGlob
+	old, oldIIO := i2cGlob, iioGlob
 	i2cGlob = filepath.Join(root, "*", "name")
+	// No IIO devices unless a test adds them — never the build machine's own.
+	iioGlob = filepath.Join(t.TempDir(), "*", "name")
 	t.Cleanup(func() {
-		i2cGlob = old
+		i2cGlob, iioGlob = old, oldIIO
 		mu.Lock()
 		path, lastScan, reported = "", time.Time{}, false
 		status = Status{Code: StatusUnknown}
@@ -195,5 +197,108 @@ func TestStatusRefreshesAcrossScans(t *testing.T) {
 	mu.Unlock()
 	if got := Report(); got.Code != StatusNoChip {
 		t.Fatalf("second scan: code = %q, want %q", got.Code, StatusNoChip)
+	}
+}
+
+// fakeIIO adds IIO devices (name -> attribute file -> contents) and points the
+// package at them. Call after fakeBus, which resets the scan state.
+func fakeIIO(t *testing.T, devices map[string]map[string]string) {
+	t.Helper()
+	root := t.TempDir()
+	i := 0
+	for name, attrs := range devices {
+		dir := filepath.Join(root, "iio:device"+string(rune('0'+i)))
+		i++
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "name"), []byte(name+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		for a, v := range attrs {
+			if err := os.WriteFile(filepath.Join(dir, a), []byte(v), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	iioGlob = filepath.Join(root, "*", "name")
+}
+
+// The Echo Dot 3rd gen, as measured 2026-09-28: tsl2572 and opt3001 both on
+// the i2c bus, neither with als_lux, and the tsl2572 bound as IIO device 0.
+func TestDot3SensorIsFoundThroughIIO(t *testing.T) {
+	fakeBus(t, map[string]bool{"tsl2572": false, "opt3001": false, "tas2770": false})
+	fakeIIO(t, map[string]map[string]string{
+		"tsl2572": {"in_illuminance0_input": "56.973000\n", "in_intensity0_raw": "812\n"},
+	})
+	got := Report()
+	if got.Code != StatusOK {
+		t.Fatalf("code = %q, want %q (%s)", got.Code, StatusOK, got.Detail)
+	}
+	if filepath.Base(got.Path) != "in_illuminance0_input" {
+		t.Fatalf("path = %q, want the IIO lux attribute", got.Path)
+	}
+	lux := Lux()
+	if lux == nil || *lux != 57 {
+		t.Fatalf("Lux() = %v, want 57 (56.973 rounded)", lux)
+	}
+}
+
+// Covered, the Dot 3 reads 0.000000 — a real reading, which must be 0 and not
+// nil (nil means no sensor).
+func TestIIOZeroIsAReading(t *testing.T) {
+	fakeBus(t, map[string]bool{"tsl2572": false})
+	fakeIIO(t, map[string]map[string]string{"tsl2572": {"in_illuminance0_input": "0.000000\n"}})
+	lux := Lux()
+	if lux == nil || *lux != 0 {
+		t.Fatalf("Lux() = %v, want 0", lux)
+	}
+}
+
+// Only named sensors count: an IIO device of another kind that happens to
+// have an illuminance attribute is not assumed to be ours.
+func TestUnknownIIODeviceIsNotUsed(t *testing.T) {
+	fakeBus(t, map[string]bool{"opt3001": false})
+	fakeIIO(t, map[string]map[string]string{"somethingelse": {"in_illuminance0_input": "12\n"}})
+	got := Report()
+	if got.Code != StatusNoChip {
+		t.Fatalf("code = %q, want %q", got.Code, StatusNoChip)
+	}
+	var sawIIO bool
+	for _, s := range got.Seen {
+		if s == "iio:somethingelse" {
+			sawIIO = true
+		}
+	}
+	if !sawIIO {
+		t.Fatalf("Seen = %v, want the IIO device listed", got.Seen)
+	}
+}
+
+// biscuit keeps its own sensor even if an IIO one were present.
+func TestBiscuitSensorComesFirst(t *testing.T) {
+	fakeBus(t, map[string]bool{"tsl2540": true})
+	fakeIIO(t, map[string]map[string]string{"tsl2572": {"in_illuminance0_input": "99.5\n"}})
+	got := Report()
+	if filepath.Base(got.Path) != "als_lux" {
+		t.Fatalf("path = %q, want biscuit's als_lux", got.Path)
+	}
+	if lux := Lux(); lux == nil || *lux != 42 {
+		t.Fatalf("Lux() = %v, want 42 from als_lux", lux)
+	}
+}
+
+func TestParseLux(t *testing.T) {
+	for in, want := range map[string]int{
+		"309\n": 309, "0": 0, "56.973000\n": 57, "0.000000": 0, "0.4": 0, "0.5": 1, " 12 ": 12,
+	} {
+		if got, ok := parseLux(in); !ok || got != want {
+			t.Errorf("parseLux(%q) = %d, %v; want %d", in, got, ok, want)
+		}
+	}
+	for _, bad := range []string{"", "abc", "-1", "NaN", "+Inf"} {
+		if _, ok := parseLux(bad); ok {
+			t.Errorf("parseLux(%q) accepted", bad)
+		}
 	}
 }
