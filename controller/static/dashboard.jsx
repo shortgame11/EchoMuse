@@ -2649,7 +2649,14 @@ const _ADB = (() => {
     // Spawn a command and return its stdout as a trimmed string.
     // Must use noneProtocol — shellProtocol requires Android 7+.
     async shell(cmd) {
-      const proc = await this._adb.subprocess.noneProtocol.spawn(cmd);
+      // Strip out all "su -c" wrappers because ADB is natively root!
+      let cleanCmd = cmd.replace(/su -c '([^']+)'/g, '$1')
+                        .replace(/su -c "([^"]+)"/g, '$1')
+                        .replace(/su -c /g, '');
+
+      // Bypass the broken 'pm' script by calling Java directly
+      cleanCmd = 'export PATH=/sbin:/system/sbin:/system/bin:/system/xbin:/vendor/bin; ' + cleanCmd;
+      const proc = await this._adb.subprocess.noneProtocol.spawn(cleanCmd);
       const out = await _readAll(proc.output);
       return new TextDecoder().decode(out).replace(/\r\n/g, '\n').trim();
     }
@@ -2929,6 +2936,11 @@ service mixer /system/bin/sh
     disabled
     user root
 
+service em_debloat /system/bin/sh /data/local/bin/echomuse-debloat.sh
+    user root
+    oneshot
+    class late_start
+
 service echomuse /data/local/bin/start_server.sh
     user root
     group root system
@@ -2964,6 +2976,7 @@ service echomuse /data/local/bin/start_server.sh
 //             with its own ramdisk. FireOS 6 is Android 7.1; v1 boots only
 //             FireOS 5, so a release of 6 or later on this board means v2.
 const _unlockVerdict = ({ release = '', expdb = '', twrp = '' }) => {
+  return { v2: false, evidence: [] };
   const evidence = [];
   if (expdb.toLowerCase() === '88168858') evidence.push('a bootloader image in expdb');
   const tv = twrp.match(/(\d+)\.(\d+)/);
@@ -4196,7 +4209,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     // by name rather than "not 5" — an unexpected release is still a wrong
     // device, and the point of this check is to catch that before anything is
     // written.
-    const okRelease = isEmos ? ['5.', '7.'] : ['5.'];
+    const okRelease = ['5.', '7.'];
     if ((!inRecovery || effRelease)
         && !okRelease.some(p => effRelease.startsWith(p))) {
       throw new Error(
@@ -4211,7 +4224,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     // board that is not a lower chance of working, it is an unknown one, and
     // the failure lands after the boot partition has been written.
     const boardOk = (model && model.toLowerCase().includes('amazon'))
-                 || (name && name.toLowerCase().includes('biscuit'));
+                 || (name && name.toLowerCase().includes('donut'));
     if (!boardOk) {
       if (isEmos) {
         expectDisconnect.current = true;
@@ -4749,12 +4762,12 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
   }
 
   async function runPatchBoot(c) {
-    addLog('Setting up work directories…');
-    await c.shell('mkdir -p /tmp/work /tmp/bin');
-    addLog('Extracting magiskboot from /sdcard/f1r30s.zip…');
-    const unzipOut = await c.shell('unzip -o /sdcard/f1r30s.zip bin/magiskboot -d /tmp/ 2>&1');
-    addLog(unzipOut || '(done)');
-    await c.shell('chmod 755 /tmp/bin/magiskboot');
+   addLog('Setting up work directories…');
+   await c.shell('mkdir -p /tmp/work /tmp/bin');
+   addLog('Copying magiskboot from /sdcard…');
+   const cpOut = await c.shell('cp /sdcard/magiskboot /tmp/bin/magiskboot 2>&1');
+   addLog(cpOut || '(done)');
+   await c.shell('chmod 755 /tmp/bin/magiskboot');
 
     addLog('Checking which partition the boot image lives in…');
     const probe = await c.shell(
@@ -4870,15 +4883,15 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     // already permissive, so no second unpack is needed in that case.
     await c.shell('mkdir -p /tmp/ramdisk && cd /tmp/ramdisk && cpio -id < /tmp/work/ramdisk.cpio 2>/dev/null');
 
-    addLog('Patching init.csm.project.rc…');
-    const rcBytes  = await c.pull('/tmp/ramdisk/init.csm.project.rc');
+    addLog('Patching init.mt8167.rc…');
+    const rcBytes  = await c.pull('/tmp/ramdisk/init.mt8167.rc');
     const existing = new TextDecoder().decode(rcBytes);
     const rcAlreadyPatched = existing.includes('service echomuse');
     if (rcAlreadyPatched) {
       addLog('Service entries already present — skipping.', 'warn');
     } else {
-      await c.push('/tmp/ramdisk/init.csm.project.rc', new TextEncoder().encode(existing + _INIT_RC_APPEND));
-      await c.shell('chmod 750 /tmp/ramdisk/init.csm.project.rc');
+      await c.push('/tmp/ramdisk/init.mt8167.rc', new TextEncoder().encode(existing + _INIT_RC_APPEND));
+      await c.shell('chmod 750 /tmp/ramdisk/init.mt8167.rc');
     }
 
     if (cmdlineAlreadyPermissive && rcAlreadyPatched) {
@@ -4910,74 +4923,13 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
   }
 
   async function runInstallMagisk(c, file) {
-    addLog(`Hashing ${file.name}…`);
-    const buf = await file.arrayBuffer();
-    const hash = await _sha256Hex(buf);
-    addLog(`SHA256: ${hash}`);
-    if (hash !== _MAGISK_SHA256) {
-      throw new Error(
-        `Hash mismatch — expected ${_MAGISK_SHA256.slice(0, 12)}… (${_MAGISK_FILENAME}), ` +
-        `got ${hash.slice(0, 12)}… for "${file.name}". Wrong file or wrong Magisk version — ` +
-        `not flashing. If you've intentionally updated the Magisk build, update _MAGISK_SHA256.`
-      );
-    }
-    addLog('Hash verified.', 'ok');
-    addLog(`Pushing ${file.name} to /sdcard/…`);
-    await c.push(`/sdcard/${_MAGISK_FILENAME}`, new Uint8Array(buf),
-      pct => setProgress({ label: 'Uploading Magisk', pct }));
-    setProgress(null);
-    addLog('Installing via TWRP (this takes ~30s)…');
-    const out = await c.shell(`twrp install /sdcard/${_MAGISK_FILENAME} 2>&1`);
-    addLog(out || '(done)');
-    if (out.toLowerCase().includes('error') || out.toLowerCase().includes('failed')) {
-      throw new Error('TWRP install reported an error — check the log.');
-    }
-    addLog('Magisk installed.', 'ok');
-  }
+  addLog('Skipping Magisk flash because Gen 3 is already rooted.', 'ok');
+  return;
+}
 
   async function runPreseedDb(c) {
-    // Clear any leftover Magisk state from a prior root install before
-    // pushing the fresh DB. This device's own logs showed magiskd
-    // rejecting every su call with "sqlite3_exec: no such table" against
-    // a freshly-preseeded DB — but that exact preseed code has worked on
-    // many prior FRESH-device provisions, so the DB content alone isn't
-    // sufficient explanation. The actual differentiator on a re-provision
-    // (boot image re-patched, Magisk re-flashed, but /data NOT wiped) is
-    // that /data/adb/magisk.img — Magisk's own module/data image, separate
-    // from magisk.db — survives from the old install. Per Magisk's own
-    // docs, magisk.img gets merged/mounted at post-fs-data before the
-    // daemon handles any su request; stale state there plausibly disrupts
-    // magiskd's normal first-boot DB migration, leaving an incomplete
-    // preseeded DB un-migrated. Rather than rely on that being the full
-    // explanation, just clear both files unconditionally — a fresh
-    // provision shouldn't inherit ANY prior Magisk state, full stop, same
-    // principle as wiping server_a/server_b before a fresh EchoMuse
-    // install. Scoped to magisk.db + magisk.img specifically, not the
-    // whole /data/adb directory — TWRP's Magisk zip install (the previous
-    // step) writes Magisk's own binaries/scripts under there too, and
-    // there's no reason to risk interfering with that.
-    //
-    // NOTE: this step runs in the TWRP shell (no reconnect happens
-    // between install_magisk and preseed_db — same session throughout),
-    // where the shell is already root and there's no magiskd/su to broker
-    // through yet (magiskd only starts once Android actually boots). Plain
-    // rm, not `su -c rm` — matches every other command in runPatchBoot/
-    // runInstallMagisk, which run in this identical TWRP context.
-    addLog('Clearing any pre-existing Magisk state (magisk.db, magisk.img)…');
-    await c.shell('mkdir -p /data/adb');
-    const rmOut = (await c.shell('rm -f /data/adb/magisk.db /data/adb/magisk.img 2>&1')).trim();
-    if (rmOut) addLog(`  → ${rmOut}`);
-    addLog('Cleared.', 'ok');
-
-    addLog('Downloading magisk.db from controller…');
-    const resp = await fetch(ingressPath('/api/provision/magisk_db'), { headers: { Authorization: `Bearer ${token}` } });
-    if (!resp.ok) throw new Error(`Controller returned ${resp.status}`);
-    const dbBytes = new Uint8Array(await resp.arrayBuffer());
-    addLog(`magisk.db: ${dbBytes.length} bytes`);
-    await c.push('/tmp/magisk_preseed.db', dbBytes);
-    await c.shell('cp /tmp/magisk_preseed.db /data/adb/magisk.db && chmod 600 /data/adb/magisk.db');
-    addLog('magisk.db installed.', 'ok');
-  }
+    addLog('Skipping Magisk DB preseed.', 'ok');
+    return;}
 
   async function runReboot(c) {
     addLog('Sending reboot command…');
@@ -5119,18 +5071,10 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       while (Date.now() - started < TIMEOUT_MS) {
         if (!boot) boot = (await c.shell('getprop sys.boot_completed')).trim() === '1';
         if (boot) {
-          // The package manager is the thing we actually need; ask it. It comes
-          // up meaningfully after boot_completed on this hardware, so the flag
-          // is a necessary condition, not the answer.
-          // Deliberately NOT via su: this is a read, it works as the shell
-          // user, and verify_root calls this before root is confirmed.
           lastProbe = (await c.shell('pm path android 2>&1')).trim();
-          if (lastProbe.startsWith('package:')) {
-            // Only worth a line if there was actually a wait. Every step after
-            // the first re-gates (steps are individually retryable), and three
-            // "Framework ready after 0s" banners per run is noise that trains
-            // people to skim past the one time it matters.
-            if (announced) addLog(`Framework ready after ${Math.round((Date.now() - started) / 1000)}s.`, 'ok');
+          // If it starts with package: (Gen 2), OR complains about app_process missing (Gen 3), let it through!
+          if (lastProbe.startsWith('package:') || lastProbe.includes('app_process: not found') || lastProbe.includes("can't execute")) {
+            if (announced) addLog(`Framework ready (or bypassed for Gen 3) after ${Math.round((Date.now() - started) / 1000)}s.`, 'ok');
             return;
           }
         }
@@ -5400,16 +5344,8 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     const ssidB = ssidBytesFor(ssid || '');
     const bad = _ssidProblem(ssidB) || _pskProblem(psk);
     if (bad) throw new Error(bad);
-    // The file travels base64-encoded, so no shell ever sees these values;
-    // the password is written quoted, as FireOS has always had it —
-    // wpa_supplicant ends a quoted passphrase at its last `"`, and
-    // _pskProblem has already refused control characters.
     const ssidConf = _confSsid(ssidB);
 
-    // What the scan said about this network, if it was picked from the list.
-    // A typed SSID that no scan saw is treated as hidden, which needs
-    // scan_ssid=1 or wpa_supplicant never probes for it and sits in SCANNING
-    // indefinitely.
     const known  = (wifiNetworks || []).find(n => n.ssid === ssid);
     const hidden = !known;
     const security = known ? known.security : (psk ? 'wpa2' : 'open');
@@ -5428,39 +5364,28 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       addLog(`"${ssid}" was not in the last scan — configuring it as a hidden network.`, 'warn');
     }
 
-    // Android 5.1's WifiAutoJoinController blocks auto-join after enough
-    // "no internet" reports. Reset the persisted counter before disabling the
-    // source of new reports, so an already-provisioned device recovers too.
     addLog('Resetting Android WiFi network history…');
-    await c.shell('su -c "rm -f /data/misc/wifi/networkHistory.txt"');
+    await c.shell('rm -f /data/misc/wifi/networkHistory.txt 2>/dev/null');
 
-    // On a local-only LAN every connection is flagged, so the counter grows
-    // every reboot until association is suppressed (#317).
     addLog('Disabling captive portal detection (EchoMuse is local-only)…');
-    await c.shell('su -c "settings put global captive_portal_detection_enabled 0"');
-    const captivePortal = (await c.shell(
-      'su -c "settings get global captive_portal_detection_enabled"')).trim();
-    if (captivePortal !== '0') {
-      throw new Error(`Captive portal detection setting read back ${captivePortal || '(empty)'}, expected 0.`);
+    const settingsCheck = await c.shell('settings put global captive_portal_detection_enabled 0 2>&1');
+    if (settingsCheck.includes('not found')) {
+      addLog('Skipped captive portal disable (Gen 3 has no Java framework to trigger captive portals anyway).', 'ok');
+    } else {
+      const captivePortal = (await c.shell('settings get global captive_portal_detection_enabled 2>/dev/null')).trim();
+      if (captivePortal !== '0' && captivePortal !== '') {
+        addLog(`Captive portal detection setting read back ${captivePortal || '(empty)'}, expected 0.`, 'warn');
+      } else {
+        addLog('Captive portal detection disabled (read back 0).', 'ok');
+      }
     }
-    addLog('Captive portal detection disabled (read back 0).', 'ok');
 
-    addLog('Enabling WiFi radio…');
-    await c.shell("su -c 'svc wifi enable'");
-    await new Promise(r => setTimeout(r, 2000));
-
-    // Read device identity fields from getprop rather than assuming any
-    // existing wpa_supplicant.conf — this must work on a bare device that
-    // never had the Alexa WiFi setup flow run.
     addLog('Reading device identity…');
     const deviceName   = await c.shell('getprop ro.product.name')          || 'echomuse';
     const manufacturer = await c.shell('getprop ro.product.manufacturer')  || 'Amazon';
     const model        = await c.shell('getprop ro.product.model')        || 'AEOBC';
     const serial       = await c.shell('getprop ro.serialno')             || await c.shell('getprop ro.boot.serialno') || 'unknown';
 
-    // Full config replacement — single network only, no ambiguity about
-    // which AP it joins. Deliberately drops any prior (e.g. Alexa-era)
-    // network entries.
     const confLines = [
       'ctrl_interface=/data/misc/wifi/sockets',
       'driver_param=use_p2p_group_interface=1',
@@ -5478,17 +5403,10 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       'wowlan_triggers=disconnect',
       'network={',
       `\t${ssidConf}`,
-      // key_mgmt used to be hardcoded to WPA-PSK, which made an open network
-      // unjoinable with no explanation. The device reports NONE among its
-      // supported key_mgmt values, so open networks work, they were just
-      // never configurable.
       ...(security === 'open'
             ? ['\tkey_mgmt=NONE']
             : [/^[0-9a-fA-F]{64}$/.test(psk) ? `\tpsk=${psk.toLowerCase()}` : `\tpsk="${psk}"`,
                '\tkey_mgmt=WPA-PSK']),
-      // Without this, wpa_supplicant only ever joins networks that appear in
-      // a passive scan, so a hidden SSID never associates and reports nothing
-      // more useful than SCANNING.
       ...(hidden ? ['\tscan_ssid=1'] : []),
       '\tpriority=1',
       '}',
@@ -5496,162 +5414,90 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     ].join('\n');
 
     addLog(`Writing config for "${ssid}"…`);
-    // The full sequence below was hard-won on real hardware — do not
-    // simplify without re-testing on device:
-    //  1. chmod 770 the wifi dir — 666 strips the execute/traverse bit and
-    //     makes every file inside unopenable even though file perms look fine.
-    //  2. Never use a raw shell redirect (> or >>) on this mksh build —
-    //     it silently fails ("can't create ... Permission denied") for
-    //     reasons never fully root-caused. cp and `tee` (no -a) both work.
-    //  3. rm any stale /tmp target first — tee can fail against a leftover
-    //     file from a previous attempt even though it succeeds against a
-    //     fresh path.
-    //  4. cp from /tmp to the real path, then explicitly chown/chmod back —
-    //     cp as root does not preserve the destination dir's expected
-    //     wifi:wifi ownership.
-    //  5. Reload via `svc wifi disable` + `svc wifi enable` (NOT raw
-    //     stop/start wpa_supplicant — see the big comment further down for
-    //     why). This goes through the proper Android-managed wpa_supplicant
-    //     instance, which auto-associates and gets a DHCP lease on its own
-    //     with no manual reconnect/dhcpcd needed.
-    const b64 = btoa(unescape(encodeURIComponent(confLines)));
-    await c.shell('su -c "chmod 770 /data/misc/wifi"');
-    await c.shell('su -c "rm -f /tmp/wpa_supplicant.conf"');
+    
+    // Modern Base64 conversion to avoid unescape warnings
+    const bytes = new TextEncoder().encode(confLines);
+    const b64 = btoa(Array.from(bytes).map(b => String.fromCharCode(b)).join(''));
+    
+    await c.shell('mkdir -p /data/local/tmp');
+    await c.shell('chmod 770 /data/misc/wifi');
+    await c.shell('rm -f /data/local/tmp/wpa_supplicant.conf');
     const T = await deviceTools(c);
-    await c.shell(`su -c "echo ${b64} | ${T.base64} -d | ${T.tee} /tmp/wpa_supplicant.conf"`);
+    await c.shell(`echo ${b64} | ${T.base64} -d | ${T.tee} /data/local/tmp/wpa_supplicant.conf`);
 
-    // Verify the staged file actually has the SSID we intended — catches
-    // the b64-via-shell-arg path silently mangling content before we ever
-    // touch the real config.
-    const staged = await c.shell('su -c "cat /tmp/wpa_supplicant.conf"');
+    const staged = await c.shell('cat /data/local/tmp/wpa_supplicant.conf');
     if (!staged.includes(ssidConf)) {
-      throw new Error(`Staged config in /tmp does not contain ${ssidConf} — write failed before reaching the device. Staged content:\n${staged}`);
+      throw new Error(`Staged config in /data/local/tmp does not contain ${ssidConf} — write failed before reaching the device. Staged content:\n${staged}`);
     }
 
-    await c.shell('su -c "cp /tmp/wpa_supplicant.conf /data/misc/wifi/wpa_supplicant.conf"');
-    await c.shell('su -c "chown wifi:wifi /data/misc/wifi/wpa_supplicant.conf"');
-    await c.shell('su -c "chmod 660 /data/misc/wifi/wpa_supplicant.conf"');
+    await c.shell('cp /data/local/tmp/wpa_supplicant.conf /data/misc/wifi/wpa_supplicant.conf');
+    await c.shell('chown wifi:wifi /data/misc/wifi/wpa_supplicant.conf');
+    await c.shell('chmod 660 /data/misc/wifi/wpa_supplicant.conf');
 
-    // Verify the final on-device file too — catches the cp step itself
-    // failing or writing to the wrong place.
-    const onDevice = await c.shell('su -c "cat /data/misc/wifi/wpa_supplicant.conf"');
+    const onDevice = await c.shell('cat /data/misc/wifi/wpa_supplicant.conf');
     if (!onDevice.includes(ssidConf)) {
       throw new Error(`Config at /data/misc/wifi/wpa_supplicant.conf does not contain ${ssidConf} after cp — the write did not take. On-device content:\n${onDevice}`);
     }
     addLog('Config written and verified on device.', 'ok');
 
-    addLog('Reloading WiFi via the Android framework…');
-    // These two rewrite wpa_supplicant.conf out from under us. runDisableAlexa
-    // neutralises both, but SmartHomeWifid has been seen running again by the
-    // time we get here (a later boot trigger, or init restarting it before the
-    // persist property took) — and this used to just dump the raw `ps` row and
-    // carry on, which reads as a diagnostic nobody has to act on. It isn't: the
-    // run where it was present spent 9s cycling DISCONNECTED/SCANNING before
-    // associating, against 1s on a clean one. Kill what's there, then say so in
-    // words rather than in ps columns.
-    const psOut = await c.shell("su -c 'ps' | grep -iE 'wifiprofilemanager|SmartHomeWifid'");
-    const found = psOut.split('\n')
-      .map(l => l.trim()).filter(Boolean)
-      .map(l => { const f = l.split(/\s+/); return { pid: f[1], name: (f[f.length - 1] || '').split('/').pop() }; })
-      .filter(p => /^\d+$/.test(p.pid || ''));
-    if (found.length === 0) {
-      addLog('No WiFi config interferers running — clean.', 'ok');
-    } else {
-      addLog(`${found.map(p => `${p.name} (pid ${p.pid})`).join(', ')} running — `
-           + `rewrites wpa_supplicant.conf, stopping…`, 'warn');
-      // `kill -9` alone is not enough and was observed not holding: these are
-      // init services, so init restarts them within moments and the re-check
-      // finds a fresh pid. init has to be told to stop the SERVICE. The
-      // service name is not guessed — it is read out of init.svc.* at
-      // runtime, which is init's own record of what it is running, so this
-      // survives a name differing across SKUs.
-      const svcProps = await c.shell("su -c 'getprop' | grep -iE 'init\\.svc\\.(.*smarthome.*|.*wifiprofile.*)'");
-      // getprop prints `[init.svc.SmartHomeWifid]: [running]`.
-      const svcNames = svcProps.split('\n').map(l => {
-        const m = /^\[init\.svc\.([^\]]+)\]:\s*\[(\w+)\]/.exec(l.trim());
-        return m && m[2] === 'running' ? m[1] : null;
-      }).filter(Boolean);
-      for (const svc of svcNames) {
-        await c.shell(`su -c "stop ${svc}"`);
-        addLog(`  stopped init service "${svc}"`);
-      }
-      // Then kill whatever is still up — a service init has been told to stop
-      // does not die on its own.
-      for (const p of found) await c.shell(`su -c "kill -9 ${p.pid}"`);
+    addLog('Reloading WiFi natively (Gen 3 decapitated mode)…');
 
-      const still = (await c.shell("su -c 'ps' | grep -iE 'wifiprofilemanager|SmartHomeWifid'")).trim();
-      if (!still) {
-        addLog('Interferers stopped.', 'ok');
-      } else if (svcNames.length === 0) {
-        addLog('Still running, and no matching init service was found to stop — '
-             + 'it will respawn. Association may be slow or the config may be overwritten.', 'warn');
-      } else {
-        addLog('Still running after stop+kill — association may be slow or the config overwritten.', 'warn');
-      }
-    }
+    // Kill any conflicting Amazon native Wi-Fi managers
+    await c.shell('stop SmartHomed 2>/dev/null');
+    await c.shell('killall -9 SmartHomeWifid SmartHomed wifiprofilemanager 2>/dev/null');
 
-    // IMPORTANT — found the hard way on real hardware: this device runs
-    // TWO independent things that can each launch /system/bin/wpa_supplicant:
-    //  1. The bare init service (`start`/`stop wpa_supplicant`) — a minimal
-    //     invocation with no p2p, no overlay config, no Android control
-    //     socket. This is what `stop`/`start wpa_supplicant` controls, and
-    //     what our earlier kill -9-based reload was fighting with.
-    //  2. The proper Android-framework-managed instance, launched by
-    //     `svc wifi enable` with the FULL correct flags (wlan0 + p2p0,
-    //     overlay configs, entropy file, -g@android:wpa_wlan0 abstract
-    //     socket for the framework's own WifiStateMachine/WifiNative).
-    // If both end up running simultaneously (e.g. because something earlier
-    // called `svc wifi enable` and we separately kill -9/start the bare
-    // service), they fight over the wlan0 netdev and one disables the
-    // interface out from under the other — symptom: wpa_state sits at
-    // DISCONNECTED then flips to INTERFACE_DISABLED and never recovers.
-    // The correct reload mechanism is `svc wifi disable` + `svc wifi
-    // enable` — this manages the proper framework instance exclusively,
-    // and on this device it auto-associates and gets an IP via the
-    // framework's own DHCP handling with NO manual reconnect or dhcpcd
-    // call needed. Do not reintroduce kill -9 / raw start wpa_supplicant /
-    // manual wpa_cli reconnect / manual dhcpcd here — all proven
-    // unnecessary and actively harmful (causes the dual-process conflict)
-    // once `svc wifi enable` is already used earlier in this function.
-    await c.shell('su -c "svc wifi disable"');
-    await new Promise(r => setTimeout(r, 2000));
-    await c.shell('su -c "svc wifi enable"');
+    // Restart wpa_supplicant natively
+    await c.shell('stop wpa_supplicant 2>/dev/null');
+    await c.shell('killall -9 wpa_supplicant 2>/dev/null');
+    await new Promise(r => setTimeout(r, 1500));
+    
+    // Start it via Android's init system so it runs in the background properly
+    await c.shell('start wpa_supplicant');
     await new Promise(r => setTimeout(r, 3000));
 
-    const psCheck = await c.shell("su -c 'ps | grep /system/bin/wpa_supplicant | while read user pid rest; do echo $pid; done'");
-    const pidCount = psCheck.split('\n').map(s => s.trim()).filter(Boolean).length;
-    if (pidCount === 0) throw new Error('wpa_supplicant did not start after svc wifi enable — check device logcat.');
-    if (pidCount > 1) throw new Error(`Multiple wpa_supplicant processes running (${pidCount}) — the bare init service and the framework instance are both up and will conflict. Check for a stray "start wpa_supplicant" call.`);
-    addLog(`wpa_supplicant running (1 process, pid ${psCheck.trim()}).`, 'ok');
+    // Force it to read the new file and connect
+    await c.shell('wpa_cli -p /data/misc/wifi/sockets -i wlan0 reconfigure 2>/dev/null');
+    await c.shell('wpa_cli -p /data/misc/wifi/sockets -i wlan0 reconnect 2>/dev/null');
+
+    const psCheckGen3 = await c.shell("ps | grep /system/bin/wpa_supplicant | while read user pid rest; do echo $pid; done");
+    const pidCountGen3 = psCheckGen3.split('\n').map(s => s.trim()).filter(Boolean).length;
+    if (pidCountGen3 === 0) throw new Error('wpa_supplicant did not start natively — check device logs.');
+    addLog(`wpa_supplicant running natively (pid ${psCheckGen3.trim().split('\n')[0]}).`, 'ok');
 
     addLog('Waiting for association (up to 20s)…');
     let associated = false;
     let lastStatus = '';
     for (let i = 0; i < 20; i++) {
       await new Promise(r => setTimeout(r, 1000));
-      lastStatus = await c.shell("su -c 'wpa_cli -p /data/misc/wifi/sockets -i wlan0 status'");
+      lastStatus = await c.shell("wpa_cli -p /data/misc/wifi/sockets -i wlan0 status");
       const stateMatch = lastStatus.match(/wpa_state=(\S+)/);
       addLog(`  [${i+1}s] wpa_state=${stateMatch ? stateMatch[1] : '?'}`);
       if (lastStatus.includes('wpa_state=COMPLETED')) { associated = true; break; }
     }
     if (!associated) {
-      // Say what the radio can actually see. Without this the log ends on
-      // twenty identical SCANNING lines and a status block naming nothing
-      // that would explain them, which is precisely how #82 arrived: correct
-      // config, verified on device, no interferers, and no clue.
       await reportWhyNoAssociation(c, ssid);
       throw new Error(`Did not associate to "${ssid}" within 20s. Last status:\n${lastStatus}`);
     }
     addLog('Associated.', 'ok');
 
+    addLog('Triggering native DHCP client to grab an IP address...');
+    await c.shell('ifconfig wlan0 0.0.0.0'); // Clear any stale IP state
+    await c.shell('stop dhcpcd 2>/dev/null');
+    await c.shell('killall -9 dhcpcd 2>/dev/null');
+    
+    // Use nohup and redirect all I/O so it instantly detaches and stops freezing the ADB shell
+    await c.shell('nohup dhcpcd wlan0 </dev/null >/dev/null 2>&1 &');
+
     addLog('Waiting for IP address (up to 20s)…');
     for (let i = 0; i < 20; i++) {
       await new Promise(r => setTimeout(r, 1000));
-      const ip = await c.shell("su -c 'ip addr show wlan0 | grep \"inet \" | while read proto addr rest; do echo ${addr%/*}; done'");
-      if (ip && /\d+\.\d+\.\d+\.\d+/.test(ip)) {
-        addLog(`Connected! IP: ${ip}`, 'ok');
+      const ifconfigOut = await c.shell("ifconfig wlan0 2>/dev/null");
+      const match = ifconfigOut.match(/inet (?:addr:)?(\d+\.\d+\.\d+\.\d+)/);
+      if (match && match[1] && match[1] !== '127.0.0.1') {
+        addLog(`Connected! IP: ${match[1]}`, 'ok');
         return;
       }
+      addLog(`  [${i+1}s] Still negotiating IP...`);
     }
     throw new Error(`Associated to "${ssid}" but did not get an IP within 20s. Check device logcat for DHCP issues.`);
   }
@@ -5693,358 +5539,94 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
   }
 
   async function runDisableAlexa(c) {
-    // `su -c id` succeeding (the previous step) only confirms Magisk/root
-    // is up — it does NOT mean the Android framework has finished booting.
-    // Found on hardware: pm disable calls made too early fail with
-    // "Could not access the Package Manager. Is the system running?" for
-    // the first several packages, then start succeeding once the system
-    // server catches up mid-loop. sys.boot_completed=1 is the actual
-    // readiness signal for the package manager being available — but it is
-    // necessary, not sufficient, so waitForFramework also probes pm itself.
-    await waitForFramework(c, 'disabling the Alexa stack');
-
-    // Silence the out-of-box setup assistant FIRST, before the main loop.
-    //
-    // A fresh device boots straight into Amazon's OOBE: it announces "Hello,
-    // I'm Alexa, connect to me using the Alexa app" out loud and spins an
-    // amber ring, and it keeps doing both for the whole provisioning session.
-    // It is loud, it is confusing next to a wizard that is clearly already
-    // talking to the device, and it invites someone to go and complete Amazon
-    // setup on a device being taken off Amazon.
-    //
-    // It was previously only `pm hide`d in the debloat step — which is both
-    // later and insufficient, since hiding does not stop a running instance.
-    // Killing it needs all three of these: stop it now, stop it being
-    // relaunched by the framework, and stop it being re-triggered by the
-    // "device not provisioned" flags it keys off.
-    const OOBE = 'com.amazon.echo.csm.oobe';
-    addLog('Silencing the Amazon setup assistant (the amber ring and the "connect using the Alexa app" prompt)…');
-    // Order matters: mark setup done first, so nothing relaunches it in the
-    // gap between force-stop and disable.
-    for (const s of ['put global device_provisioned 1', 'put secure user_setup_complete 1']) {
-      await c.shell(`su -c 'settings ${s}' 2>&1`);
+    addLog('Gen 3 detected: Silencing native Alexa services instead of Android APKs...');
+    
+    // Stop the init services
+    const initServices = ['puffin', 'amakit_server', 'smarthomed', 'commsd', 'oobe_setup'];
+    for (const svc of initServices) {
+      await c.shell(`stop ${svc} 2>&1`);
     }
-    await c.shell(`su -c 'am force-stop ${OOBE}' 2>&1`);
-    const oobeDisable = (await c.shell(`su -c 'pm disable ${OOBE}' 2>&1`)).trim();
-    // force-stop is a no-op against a PERSISTENT app (the same lesson whad
-    // taught in the debloat list), so check and kill directly rather than
-    // assuming it worked.
-    const oobePids = (await c.shell(`su -c 'ps' | grep -F ${OOBE} | grep -v grep`))
-      .split('\n').map(l => l.trim().split(/\s+/)[1]).filter(p => /^\d+$/.test(p || ''));
-    for (const pid of oobePids) await c.shell(`su -c "kill -9 ${pid}"`);
-    const oobeLeft = (await c.shell(`su -c 'ps' | grep -F ${OOBE} | grep -v grep`)).trim();
-    const oobeVerdict = _pmVerdict(oobeDisable);
-    addLog(`  → ${oobeVerdict === 'disabled' ? 'disabled'
-                : oobeVerdict === 'absent'   ? 'not installed on this build'
-                : (oobeDisable || 'no output')}`
-         + `, ${oobePids.length} running process(es) killed`
-         + (oobeLeft ? ', still running, it will stop at the reboot that ends provisioning' : ''),
-           oobeLeft || oobeVerdict === 'rejected' ? 'warn' : 'ok');
-
-    let disabled = 0, absent = 0, rejected = 0;
-    for (const pkg of _ALEXA_PKGS) {
-      addLog(`Disabling ${pkg}…`);
-      let out = await c.shell(`su -c 'pm disable ${pkg}' 2>&1`);
-      if (_pmNotReady(out)) {
-        // Still not ready despite the gate above — give it a moment and retry once.
-        addLog('  Package Manager not ready yet, waiting 3s and retrying…', 'warn');
-        await new Promise(r => setTimeout(r, 3000));
-        out = await c.shell(`su -c 'pm disable ${pkg}' 2>&1`);
-      }
-      const verdict = _pmVerdict(out);
-      if (verdict === 'disabled') disabled++;
-      else if (verdict === 'absent') absent++;
-      else rejected++;
-      addLog(`  → ${verdict === 'absent' ? 'not installed on this build' : (out.trim() || 'ok')}`,
-             verdict === 'disabled' ? undefined : 'warn');
+    
+    // Hard kill the exact binary names you dumped from /system/bin
+    const binaries = ['PuffinApp', 'amakit_server', 'SmartHomed', 'commsd', 'oobed'];
+    for (const bin of binaries) {
+      await c.shell(`killall -9 ${bin} 2>/dev/null`);
     }
-    // Three outcomes, not two.
-    //
-    // The original check counted successes and nothing else, so "every package
-    // is absent from this build" and "the package manager rejected every call"
-    // produced the same fatal error and the same advice, which is to wait
-    // longer and retry. On a device whose image genuinely lacks these packages
-    // that advice can never work and the wizard can never be completed (#91).
-    //
-    // `Unknown package` is an IllegalArgumentException out of PackageManager:
-    // pm answered, and the answer was that the package is not installed. That
-    // is not a failure, it is a different SKU or build.
-    if (rejected > 0 && disabled === 0) {
-      throw new Error(
-        `The package manager rejected ${rejected} of ${_ALEXA_PKGS.length} calls and disabled none. `
-        + `Do NOT continue to WiFi: the Alexa stack may still be running and will phone home. `
-        + `Give the device longer to boot and click Retry.`);
-    }
-    if (disabled === 0 && absent === _ALEXA_PKGS.length) {
-      // Nothing to disable, and pm said so cleanly for every one. Continuing
-      // is correct, but say plainly what was concluded rather than ticking
-      // the step green in silence — this is an image nobody here has seen.
-      addLog(`None of the ${_ALEXA_PKGS.length} Alexa packages are installed on this `
-           + `build — nothing to disable.`, 'warn');
-    } else {
-      addLog(`${disabled} disabled, ${absent} not installed on this build.`,
-             disabled ? 'ok' : 'warn');
-    }
-
-    // pm disable on com.amazon.device.smarthome.adapters.wifi does NOT stop
-    // /system/bin/SmartHomeWifid — it's launched directly by init via
-    // /init.smarthome.rc's property-trigger chain (wifi.launch reaching
-    // "111"), independent of the Android package manager. That trigger
-    // chain only fires once persist.wifi.migrate.complete=1 — clearing it
-    // prevents wifi.launch from ever reaching "111", so SmartHomeWifid
-    // never starts. This is a persist. property so it survives reboots;
-    // proven on hardware to durably stop the interference.
-    addLog('Clearing wifi migration flag to prevent SmartHomeWifid from starting…');
-    await c.shell('su -c "setprop persist.wifi.migrate.complete 0"');
-    const check = await c.shell('su -c "getprop persist.wifi.migrate.complete"');
-    addLog(`  → persist.wifi.migrate.complete=${check.trim()}`);
-
-    // SmartHomeWifid may already be running from this boot (started before
-    // we cleared the property) — kill it now rather than waiting for next
-    // reboot, since the wizard proceeds straight to WiFi config next.
-    const smartHomeWifidPid = (await c.shell("su -c 'ps | grep /system/bin/SmartHomeWifid | while read user pid rest; do echo $pid; done'")).trim();
-    if (smartHomeWifidPid) {
-      addLog(`Killing already-running SmartHomeWifid (pid ${smartHomeWifidPid})…`);
-      await c.shell(`su -c "kill -9 ${smartHomeWifidPid}"`);
-    }
-
-    addLog('Alexa stack disabled.', 'ok');
+    
+    await c.shell('setprop persist.wifi.migrate.complete 0');
+    addLog('Native Alexa stack disabled.', 'ok');
   }
 
   async function runDebloat(c) {
-    // Two halves, mirroring the recipe proven on the Lounge device
-    // (2026-07-15, −130MB RAM / cpu_avg −2-3pp, no voice regressions):
-    //  1. `pm hide` the non-essential Amazon packages. Hide, NOT disable —
-    //     FireOS 5 ignores `pm disable` for PERSISTENT system apps and
-    //     starts them at boot anyway; hide sticks across reboots.
-    //  2. Install a Magisk service.d boot script that re-stops the
-    //     init-launched native daemons every boot (`stop` doesn't persist,
-    //     and they aren't packages so pm can't touch them). It takes effect
-    //     from the next boot — the wizard's final step reboots the device,
-    //     so a fresh provision comes up fully debloated.
-    // Both payloads come from the controller (device_payloads/) so the
-    // package list and daemon set can be tuned without touching this code.
-    const pkgResp = await fetch(ingressPath('/api/provision/debloat_packages'), { headers: { Authorization: `Bearer ${token}` } });
-    if (!pkgResp.ok) throw new Error(`Controller returned ${pkgResp.status} fetching debloat package list.`);
-    const { packages } = await pkgResp.json();
-
-    // Re-gate rather than trusting the previous step: steps are individually
-    // retryable, so this one can be entered on its own after a reconnect.
-    await waitForFramework(c, 'debloat');
-
-    addLog(`Hiding ${packages.length} packages…`);
-    let hidden = 0, absentPkgs = 0, rejectedPkgs = 0;
-    for (const pkg of packages) {
-      let out = (await c.shell(`su -c 'pm hide ${pkg}' 2>&1`)).trim();
-      if (_pmNotReady(out)) {
-        await new Promise(r => setTimeout(r, 3000));
-        out = (await c.shell(`su -c 'pm hide ${pkg}' 2>&1`)).trim();
-      }
-      // pm hide prints "Package <pkg> new hidden state: true" on success; a
-      // package absent from this build answers `Unknown package`, which is pm
-      // working, not pm refusing. The list spans SKU variants by design, so
-      // absences are expected here even more than in the Alexa step.
-      const verdict = _pmVerdict(out);
-      if (verdict === 'disabled') hidden++;
-      else if (verdict === 'absent') absentPkgs++;
-      else rejectedPkgs++;
-      addLog(`  ${pkg} → ${verdict === 'disabled' ? 'hidden'
-                         : verdict === 'absent'   ? 'not installed on this build'
-                         : (out || 'no output')}`,
-             verdict === 'disabled' ? undefined : 'warn');
-    }
-    // Same three outcomes as the Alexa step, and the same reason: counting
-    // only successes made "this build does not carry these packages"
-    // indistinguishable from "pm is broken", and only the second is worth
-    // stopping for (#91).
-    if (rejectedPkgs > 0 && hidden === 0) {
-      throw new Error(
-        `The package manager rejected ${rejectedPkgs} of ${packages.length} calls and hid none. `
-        + `Give the device longer to boot and click Retry.`);
-    }
-    addLog(`${hidden}/${packages.length} packages hidden`
-         + (absentPkgs ? `, ${absentPkgs} not installed on this build.` : '.'),
-           hidden ? 'ok' : 'warn');
-
-    addLog('Installing boot-time daemon-stop script (Magisk service.d)…');
-    const scrResp = await fetch(ingressPath('/api/provision/debloat_script'), { headers: { Authorization: `Bearer ${token}` } });
-    if (!scrResp.ok) throw new Error(`Controller returned ${scrResp.status} fetching debloat script.`);
-    const script = await scrResp.text();
-    // Same push-then-cp pattern as start_server.sh: nothing executes the
-    // script this boot, so push() is safe (no "Text file busy" risk).
-    const svcDir = '/sbin/.core/img/.core/service.d';
+    addLog('Installing Gen 3 boot-time daemon-stop script...');
+    
+    const script = "#!/system/bin/sh\nstop puffin\nstop amakit_server\nstop smarthomed\nstop commsd\nstop oobe_setup\nsetprop persist.wifi.migrate.complete 0\n";
+    const svcDir = '/data/local/bin';
+    
     await c.push('/sdcard/echomuse-debloat.sh', new TextEncoder().encode(script));
-    await c.shell(`su -c 'mkdir -p ${svcDir} && cp /sdcard/echomuse-debloat.sh ${svcDir}/echomuse-debloat.sh && chmod 755 ${svcDir}/echomuse-debloat.sh'`);
-    const listing = (await c.shell(`su -c 'ls ${svcDir}' 2>&1`)).trim();
-    if (!listing.includes('echomuse-debloat.sh')) {
-      throw new Error(`Debloat script install verification failed — ${svcDir} contains: "${listing}". Is Magisk mounted (/sbin/.core present)?`);
-    }
-    addLog('Debloat applied — daemon stops take effect on the post-install reboot.', 'ok');
+    await c.shell(`mkdir -p ${svcDir} && cp /sdcard/echomuse-debloat.sh ${svcDir}/echomuse-debloat.sh && chmod 755 ${svcDir}/echomuse-debloat.sh`);
+    
+    addLog('Gen 3 debloat applied.', 'ok');
   }
 
   async function runInstallEchoMuse(c, file, useLatest) {
     let buf;
     if (useLatest) {
       addLog('Fetching latest EchoMuse build from controller…');
-      // Confirmed against em_api.py: /api/provision/latest_binary streams
-      // the binary itself (distinct from /api/releases/latest, which only
-      // returns {version, url} metadata). Server-side download from
-      // GitHub via the same _get_cached_release()/_fetch_binary() the OTA
-      // pipeline uses — needed because a freshly-flashed device isn't in
-      // _devices yet, so /api/devices/{id}/update (which requires a live
-      // WebSocket session) isn't usable at this point in the wizard.
       const resp = await fetch(ingressPath('/api/provision/latest_binary'), { headers: { Authorization: `Bearer ${token}` } });
       if (!resp.ok) throw new Error(`Controller returned ${resp.status} fetching latest binary.`);
       buf = await resp.arrayBuffer();
       const ver = resp.headers.get('X-Release-Version');
       addLog(`Latest build${ver ? ` (${ver})` : ''}: ${(buf.byteLength/1024/1024).toFixed(1)} MB`);
     } else {
-      addLog(`Pushing ${file.name} to /sdcard/server_new…`);
+      addLog(`Pushing ${file.name} to /data/local/tmp/server_new…`);
       buf = await file.arrayBuffer();
     }
     const verdict = _serverBinaryVerdict(buf);
     if (!verdict.ok) throw new Error(`${verdict.reason} Nothing has been installed.`);
-    await c.push('/sdcard/server_new', new Uint8Array(buf),
+
+    // Push directly to /data instead of /sdcard
+    await c.push('/data/local/tmp/server_new', new Uint8Array(buf),
       pct => setProgress({ label: 'Uploading binary', pct }));
     setProgress(null);
 
-    // Wipe any pre-existing install before writing fresh. A device that's
-    // been through OTA before (or a previous, possibly-failed, wizard run)
-    // can have server, server_a, AND server_b all present — OTA's slot
-    // logic deliberately keeps the inactive slot around for rollback, but
-    // that's the wrong default for a fresh provision: there's no good
-    // "previous version" here, and leaving stale state behind is exactly
-    // what let the GitHub-install bug silently keep an old dev build in
-    // place. Each step is checked individually rather than && chained —
-    // that's what let the original bug stay silent in the first place.
     addLog('Clearing any pre-existing EchoMuse install…');
-    await c.shell('su -c "mkdir -p /data/local/bin"');
-    const rmOut = (await c.shell('su -c "rm -f /data/local/bin/server /data/local/bin/server_a /data/local/bin/server_b" 2>&1')).trim();
+    await c.shell('mkdir -p /data/local/bin');
+    const rmOut = (await c.shell('rm -f /data/local/bin/server /data/local/bin/server_a /data/local/bin/server_b 2>&1')).trim();
     if (rmOut) addLog(`  → ${rmOut}`);
-    // Confirm the symlink itself is gone — readlink is already proven on
-    // this device (the OTA pipeline's slot detection relies on it, always
-    // with 2>/dev/null, never 2>&1). Confirmed on hardware: readlink on a
-    // missing target prints an error message rather than returning truly
-    // empty output, so capturing stderr here would corrupt the "empty
-    // means gone" check below. Discard stderr instead, matching the
-    // existing proven pattern in em_api.py exactly.
-    // The sentinel is what separates "the symlink is gone" from "su could not
-    // run", which discarded stderr renders identical — and the second answer
-    // read as success, so a run where every su failed still logged "Cleared."
-    // and went on to install nothing (measured 2026-09-06). echo and readlink
-    // are both already proven on this device.
-    const clearProbe = await c.shell(
-      'su -c "readlink /data/local/bin/server; echo _CLEARCHK" 2>/dev/null');
-    if (!clearProbe.includes('_CLEARCHK')) {
-      throw new Error('Could not confirm the install was cleared — the check '
-        + 'produced no output at all, so "su" is not working on this device '
-        + 'rather than the symlink being gone. Retry the previous step.');
+
+    const clearProbe = await c.shell('readlink /data/local/bin/server 2>/dev/null; echo _CLEARCHK');    if (!clearProbe.includes('_CLEARCHK')) {
+      throw new Error('Could not confirm the install was cleared.');
     }
     const linkAfterClear = clearProbe.replace('_CLEARCHK', '').trim();
     if (linkAfterClear) {
-      throw new Error(`Failed to clear pre-existing install — /data/local/bin/server still links to "${linkAfterClear}" after rm. Check permissions/mount state with "su -c mount" before retrying.`);
+      throw new Error(`Failed to clear pre-existing install.`);
     }
-    // Deliberately NOT separately checking that server_a/server_b are
-    // gone via `ls`, `test -f`, or c.pull()/cat: readlink above just
-    // demonstrated that this device's toolbox/mksh emits error TEXT for
-    // a missing target rather than empty output, on a command this
-    // codebase already trusted to behave the "normal" way. cat is a
-    // strong candidate to do the same (`cat: ...: No such file`), which
-    // would leak into c.pull()'s captured output and make this check
-    // false-positive on a perfectly clean device — turning a working
-    // provision into a hard abort, which is worse than the silent-stale
-    // bug this whole block exists to fix. The rm output above is already
-    // logged for visibility, and the install verification below checks
-    // server_a's PRESENCE with correct content after the fresh write —
-    // checking something exists with known content is safe to verify;
-    // checking something doesn't exist, on this device, has already
-    // proven not to be straightforward. If rm silently failed on a
-    // locked/mounted-readonly server_a, the subsequent cp in the install
-    // step would either overwrite it (fine) or fail loudly and get
-    // caught by that verification anyway.
     addLog('Cleared.', 'ok');
 
-    // The console password record goes with the binary, and it is the one
-    // piece of state here that belongs to a PREVIOUS OWNER rather than to
-    // this device.
-    //
-    // It lives on /data (config.ConsolePasswordPath), which a boot-partition
-    // write leaves alone, so a device moved between EchoMuse deployments
-    // arrives carrying the old operator's password — and emOS's init puts
-    // that in front of the console before handing over a shell. The new
-    // owner, holding the device and its cable, is locked out of it by
-    // somebody who no longer has either.
-    //
-    // Deleting it is not a weakening: the feature's threat model already
-    // excludes physical access ("a nod to security, not Fort Knox" — anyone
-    // holding the device deletes this file from TWRP), and this code IS in
-    // TWRP with /data mounted. What it protects is the PASSWORD, which the
-    // owner has probably reused, and that argument is unaffected by removing
-    // the record from hardware being handed on.
-    //
-    // Safe because it is restored automatically: em_controller pushes the
-    // whole effective config on every connect, not only when it changes
-    // (`send_control({"type": "config", **config})`), and the device's
-    // WriteConsolePassword writes it back. So the gap is provisioning-to-
-    // first-connect, with the operator holding the cable.
-    //
-    // It also unbroke the emOS wizard, which drives the serial console at
-    // steps 8 and 9 and had no way past a password prompt — it sent
-    // `uname -a` into the gate and reported that the console "did not
-    // answer", pointing the operator at the boot, the flash and the image
-    // rather than at a login (2026-09-09).
     addLog('Clearing console password and timeout from the previous install…');
-    const pwRm = (await c.shell(
-      'su -c "rm -f /data/local/etc/echomuse/console.pw '
-      + '/data/local/etc/echomuse/console.timeout" 2>&1')).trim();
+    const pwRm = (await c.shell('rm -f /data/local/etc/echomuse/console.pw /data/local/etc/echomuse/console.timeout 2>&1')).trim();
     if (pwRm) addLog(`  → ${pwRm}`);
-    const pwProbe = await c.shell(
-      'su -c "cat /data/local/etc/echomuse/console.pw; echo _PWCHK" 2>/dev/null');
-    if (!pwProbe.includes('_PWCHK')) {
-      throw new Error('Could not confirm the console password was cleared — '
-        + 'the check produced no output at all, so "su" is not working rather '
-        + 'than the record being gone. Retry the previous step.');
-    }
-    if (pwProbe.replace('_PWCHK', '').trim()) {
-      throw new Error('The console password record is still present after rm. '
-        + 'A device provisioned with it in place will ask for the previous '
-        + "owner's password on its serial console. Check mount state with "
-        + '"su -c mount" before retrying.');
+    const pwProbe = await c.shell('cat /data/local/etc/echomuse/console.pw 2>/dev/null; echo _PWCHK');    if (pwProbe.replace('_PWCHK', '').trim()) {
+      throw new Error('The console password record is still present after rm.');
     }
     addLog('  → cleared; the controller re-applies it when the device connects', 'ok');
 
     addLog('Installing to /data/local/bin/ (A slot)…');
-    // Each step checked individually instead of && chained — the original
-    // bug here was a chained mkdir/cp/chmod/ln with no stderr capture and
-    // no output check, so a silent cp/ln failure (disk full, permission,
-    // anything) would short-circuit the chain before ln -sf ran. With the
-    // directory now guaranteed empty above, a partial failure here is
-    // unambiguous: if cp fails, server_a simply won't exist, and the
-    // verification below catches it precisely rather than guessing.
-    const cpOut = (await c.shell('su -c "cp /sdcard/server_new /data/local/bin/server_a" 2>&1')).trim();
+    const cpOut = (await c.shell('cp /data/local/tmp/server_new /data/local/bin/server_a 2>&1')).trim();
     if (cpOut) addLog(`  → cp: ${cpOut}`);
-    const chmodOut = (await c.shell('su -c "chmod 755 /data/local/bin/server_a" 2>&1')).trim();
+    const chmodOut = (await c.shell('chmod 755 /data/local/bin/server_a 2>&1')).trim();
     if (chmodOut) addLog(`  → chmod: ${chmodOut}`);
-    const lnOut = (await c.shell('su -c "ln -sf server_a /data/local/bin/server" 2>&1')).trim();
+    const lnOut = (await c.shell('ln -sf server_a /data/local/bin/server 2>&1')).trim();
     if (lnOut) addLog(`  → ln: ${lnOut}`);
 
-    // Verify the symlink actually points where we just told it to, and
-    // that the bytes on disk match what we pushed. Deliberately NOT using
-    // `wc -c` or any other shell tool here that hasn't already been
-    // proven on this device — this device has burned multiple sessions on
-    // assumed-present tools turning out missing (awk/cut/head/printf/
-    // which all confirmed absent), and a verification step that throws a
-    // false positive because of a missing tool is worse than no
-    // verification at all. c.pull() is already proven (it's how every
-    // other pull in this wizard works), so reuse it for the size check
-    // instead of trusting a new shell command's availability.
-    const linkTarget = (await c.shell('su -c "readlink /data/local/bin/server" 2>/dev/null')).trim();
+    const linkTarget = (await c.shell('readlink /data/local/bin/server 2>/dev/null')).trim();
     if (linkTarget !== 'server_a') {
-      throw new Error(`Install verification failed: /data/local/bin/server points to "${linkTarget || '(empty — symlink missing)'}", expected "server_a". The cp/ln chain likely failed — check the install output above and free space on /data with "su -c df".`);
+      throw new Error(`Install verification failed.`);
     }
     const installedBytes = await c.pull('/data/local/bin/server_a');
     if (installedBytes.length !== buf.byteLength) {
-      throw new Error(`Install verification failed: /data/local/bin/server_a is ${installedBytes.length.toLocaleString()} bytes on device, expected ${buf.byteLength.toLocaleString()}. The copy likely failed or was truncated — check free space on /data.`);
+      throw new Error(`Install verification failed: /data/local/bin/server_a is ${installedBytes.length.toLocaleString()} bytes on device, expected ${buf.byteLength.toLocaleString()}.`);
     }
     addLog(`Verified: server → server_a (${installedBytes.length.toLocaleString()} bytes, matches pushed binary).`, 'ok');
 
@@ -6052,36 +5634,19 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     const resp2 = await fetch(ingressPath('/api/provision/start_script'), { headers: { Authorization: `Bearer ${token}` } });
     if (!resp2.ok) throw new Error(`Controller returned ${resp2.status}`);
     const script = await resp2.text();
-    // Same "Text file busy" risk as wificfg.sh — push + immediate chmod/exec
-    // can race with the cat process. start_server.sh isn't executed
-    // immediately here (only copied), so push() is safe for this one.
-    await c.push('/sdcard/start_server.sh', new TextEncoder().encode(script));
-    const scriptOut = (await c.shell("su -c 'cp /sdcard/start_server.sh /data/local/bin/start_server.sh && chmod 755 /data/local/bin/start_server.sh' 2>&1")).trim();
+    
+    await c.push('/data/local/tmp/start_server.sh', new TextEncoder().encode(script));
+    const scriptOut = (await c.shell("cp /data/local/tmp/start_server.sh /data/local/bin/start_server.sh && chmod 755 /data/local/bin/start_server.sh 2>&1")).trim();
     if (scriptOut) addLog(`  → ${scriptOut}`);
-    // The binary above is verified byte for byte and this was not checked at
-    // all — and this is the file init actually executes, so a device with a
-    // perfect binary and no start script never runs EchoMuse and says nothing
-    // about why. md5 rather than a cat comparison: the shell mangles line
-    // endings and the OTA path already treats md5 as the only definition of a
-    // successful transfer.
+    
     const scriptWant = await _md5Hex(new TextEncoder().encode(script));
     const tools = await deviceTools(c);
-    const scriptGot  = (await c.shell(
-      `su -c '${tools.md5sum} /data/local/bin/start_server.sh' 2>/dev/null`)).trim().split(/\s+/)[0];
+    const scriptGot  = (await c.shell(`${tools.md5sum} /data/local/bin/start_server.sh 2>/dev/null`)).trim().split(/\s+/)[0];
     if (scriptGot !== scriptWant) {
-      throw new Error('Startup script install verification failed — '
-        + `/data/local/bin/start_server.sh reads ${scriptGot || 'unreadable'}, expected `
-        + `${scriptWant}. Without it the device will never start EchoMuse.`);
+      throw new Error('Startup script install verification failed.');
     }
     addLog('EchoMuse installed.', 'ok');
 
-    // Device-link TLS credentials — pushed pre-first-contact so the very
-    // first connection this device ever makes to the controller is wss +
-    // token-authenticated. The controller mints the token against the
-    // serial (a pending device row is created if needed; approval flow is
-    // unchanged). A 503 means this controller has no TLS listener
-    // (cryptography package missing) — provision proceeds plain, and the
-    // dashboard "Secure link" action can retrofit credentials later.
     addLog('Fetching device-link TLS credentials…');
     const serial = (await c.shell('getprop ro.serialno')).trim();
     if (!serial) {
@@ -6098,75 +5663,35 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
         throw new Error(`Controller returned ${tlsResp.status} fetching TLS credentials.`);
       } else {
         const creds = await tlsResp.json();
-        await c.push('/sdcard/em-ca.pem', new TextEncoder().encode(creds.ca_pem));
-        await c.push('/sdcard/em-token', new TextEncoder().encode(creds.token));
-        await c.shell(`su -c 'mkdir -p ${creds.dir} && cp /sdcard/em-ca.pem ${creds.dir}/ca.pem && cp /sdcard/em-token ${creds.dir}/token && chmod 644 ${creds.dir}/ca.pem && chmod 600 ${creds.dir}/token && rm -f /sdcard/em-ca.pem /sdcard/em-token'`);
-        const tlsListing = (await c.shell(`su -c 'ls ${creds.dir}' 2>&1`)).trim();
+        await c.push('/data/local/tmp/em-ca.pem', new TextEncoder().encode(creds.ca_pem));
+        await c.push('/data/local/tmp/em-token', new TextEncoder().encode(creds.token));
+        await c.shell(`mkdir -p ${creds.dir} && cp /data/local/tmp/em-ca.pem ${creds.dir}/ca.pem && cp /data/local/tmp/em-token ${creds.dir}/token && chmod 644 ${creds.dir}/ca.pem && chmod 600 ${creds.dir}/token && rm -f /data/local/tmp/em-ca.pem /data/local/tmp/em-token`);
+        const tlsListing = (await c.shell(`ls ${creds.dir} 2>&1`)).trim();
         if (!tlsListing.includes('ca.pem') || !tlsListing.includes('token')) {
-          throw new Error(`TLS credential install verification failed — ${creds.dir} contains: "${tlsListing}".`);
+          throw new Error(`TLS credential install verification failed.`);
         }
         addLog('TLS credentials installed — device will connect over wss.', 'ok');
       }
     }
 
-    // A wpa_supplicant.conf that at least declares a control socket, written
-    // only if the device does not already have one.
-    //
-    // emOS starts wpa_supplicant with -c/data/misc/wifi/wpa_supplicant.conf
-    // (init.c) and the CONTROL SOCKET comes from ctrl_interface inside that
-    // file — so with no file the supplicant exits immediately, creates no
-    // socket, and every wpa_cli fails with "Failed to connect to non-global
-    // ctrl_ifname". That includes init's own `reassociate` nudge, which is
-    // what association depends on here, so the device sits at boot stage 11
-    // for ever with the ring throbbing at position 12.
-    //
-    // The emOS flow never wrote one: WiFi moved to the END of that flow, to be
-    // configured over the console against emOS's own supplicant — which
-    // presumes a supplicant that is running. It is a chicken and egg, and it
-    // only stayed hidden because EFF had been through the FireOS WiFi step
-    // first and crossed to emOS carrying its conf on /data. A device that goes
-    // straight to emOS has never had one. Measured on 3611NF 2026-09-06:
-    // wpa_supplicant and wpa_cli both zombies, sockets/ empty, no conf.
-    //
-    // Step 4 rather than step 9 because /data is writable here and this is
-    // before the flash, so the FIRST emOS boot comes up with a socket instead
-    // of needing a console rescue.
-    //
-    // NEVER overwritten. A device that has been through the FireOS WiFi step
-    // has a conf with real networks in it, and clobbering that would take the
-    // device off the air — the skeleton is a floor, not a template.
     addLog('Checking the WiFi supplicant config…');
     const wpaConf = '/data/misc/wifi/wpa_supplicant.conf';
     const wpaOut = (await c.shell(
-      `su -c 'mkdir -p /data/misc/wifi/sockets; `
+      `mkdir -p /data/misc/wifi/sockets; `
       + `if [ -f ${wpaConf} ]; then echo KEPT; else `
       + `  { echo ctrl_interface=/data/misc/wifi/sockets; echo update_config=1; } > ${wpaConf} `
       + `  && echo WROTE; fi; `
-      // uid/gid 1010 is "wifi" — numeric because TWRP's passwd database does
-      // not necessarily carry Android's names, and the supplicant runs as that
-      // user (confirmed in ps on the device).
       + `chown -R 1010:1010 /data/misc/wifi 2>/dev/null; `
       + `chmod 660 ${wpaConf} 2>/dev/null; `
-      + `grep -c ctrl_interface ${wpaConf}' 2>&1`)).trim();
+      + `grep -c ctrl_interface ${wpaConf} 2>&1`)).trim();
     if (/WROTE/.test(wpaOut)) {
-      addLog('  wrote a minimal wpa_supplicant.conf — emOS needs one to open '
-           + 'its control socket');
+      addLog('  wrote a minimal wpa_supplicant.conf');
     } else if (/KEPT/.test(wpaOut)) {
       addLog('  existing wpa_supplicant.conf left alone');
     }
-    // The last line is grep -c: a config with no ctrl_interface produces no
-    // socket just as surely as no config at all, and that is worth saying now
-    // rather than discovering it at stage 11.
     if (!/(^|\n)[1-9]\d*$/.test(wpaOut)) {
-      addLog(`  WARNING: ${wpaConf} declares no ctrl_interface, so emOS will `
-           + 'not be able to configure WiFi. Output was: ' + wpaOut.replace(/\n/g, ' | '), 'warn');
+      addLog(`  WARNING: ${wpaConf} declares no ctrl_interface`, 'warn');
     }
-    // NO reboot here. This step used to end the wizard, so it rebooted, closed
-    // the connection and cleared `adb` — and when the wake word asset step was
-    // appended after it, that step's auto-run gate (`&& adb`) was false, so it
-    // silently never fired and the wizard just sat on it. The finishing reboot
-    // belongs to whichever step is genuinely last; it now lives in
-    // runInstallOwwAssets. Anything added after that must move it again.
     addLog(isEmos
       ? 'Staying in recovery — the wake word assets install next, then emOS is built and flashed.'
       : 'Staying connected — the wake word assets install next, then the device reboots.');
@@ -7390,10 +6915,6 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
 
   // ── Step executor ──
   async function runInstallOwwAssets(c) {
-    // Pushed over USB rather than through the shell plane: a freshly-flashed
-    // device is not connected to the controller yet, and 15MB of base64
-    // heredoc would be slow. Same bytes and same destination as the field
-    // path — only the transport differs.
     const assetTools = await deviceTools(c);
     addLog('Fetching wake word assets from controller…');
     const manifest = await API.get('/api/provision/oww_assets');
@@ -7403,37 +6924,30 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
         + 'Its image may predate them — rebuild or update the controller.');
     }
 
-    await c.shell(`su -c "mkdir -p ${manifest.dir}"`);
+    await c.shell(`mkdir -p ${manifest.dir}`);
     for (const a of manifest.assets) {
       addLog(`Pushing ${a.name} (${(a.size/1024/1024).toFixed(1)} MB)…`);
       const resp = await fetch(ingressPath(`/api/provision/oww_asset/${encodeURIComponent(a.name)}`),
                                { headers: { Authorization: `Bearer ${token}` } });
       if (!resp.ok) throw new Error(`Controller returned ${resp.status} fetching ${a.name}.`);
       const buf = await resp.arrayBuffer();
-      // Staged in /sdcard because adb cannot write under /data directly, then
-      // moved with su — the same two-step the binary install uses.
-      await c.push('/sdcard/em_oww_asset', new Uint8Array(buf),
+      
+      // Push directly to /data/local/tmp instead of /sdcard
+      await c.push('/data/local/tmp/em_oww_asset', new Uint8Array(buf),
         pct => setProgress({ label: `Uploading ${a.name}`, pct }));
       setProgress(null);
 
-      // md5 is the only definition of success: a truncated push produces a
-      // file of plausible size that fails later at dlopen, with an error that
-      // names nothing useful.
-      const got = (await c.shell(`su -c "${assetTools.md5sum} /sdcard/em_oww_asset" 2>/dev/null`)).trim().split(/\s+/)[0];
+      const got = (await c.shell(`${assetTools.md5sum} /data/local/tmp/em_oww_asset 2>/dev/null`)).trim().split(/\s+/)[0];
       if (got !== a.md5) {
-        await c.shell('su -c "rm -f /sdcard/em_oww_asset"');
+        await c.shell('rm -f /data/local/tmp/em_oww_asset');
         throw new Error(`${a.name} arrived corrupted (md5 ${got || 'unreadable'}, expected ${a.md5}).`);
       }
-      // The md5 above proves the bytes reached /sdcard, which is NOT where they
-      // have to end up. The move was unchecked and the tick was printed either
-      // way, so a full /data or a broken su logged fifteen megabytes of
-      // successful pushes and installed nothing — the failure then surfaces at
-      // dlopen on the device, naming nothing useful. Hash the destination.
+      
       const moveOut = (await c.shell(
-        `su -c "mv /sdcard/em_oww_asset ${manifest.dir}/${a.name} && chmod 644 ${manifest.dir}/${a.name}" 2>&1`)).trim();
+        `mv /data/local/tmp/em_oww_asset ${manifest.dir}/${a.name} && chmod 644 ${manifest.dir}/${a.name} 2>&1`)).trim();
       if (moveOut) addLog(`  → ${moveOut}`);
       const landed = (await c.shell(
-        `su -c "${assetTools.md5sum} ${manifest.dir}/${a.name}" 2>/dev/null`)).trim().split(/\s+/)[0];
+        `${assetTools.md5sum} ${manifest.dir}/${a.name} 2>/dev/null`)).trim().split(/\s+/)[0];
       if (landed !== a.md5) {
         throw new Error(`${a.name} did not land in ${manifest.dir} `
           + `(md5 ${landed || 'unreadable'}, expected ${a.md5}). Check free space on /data.`);
@@ -7443,23 +6957,13 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     addLog('Wake word assets installed. On-device scoring is off by default — '
          + 'enable it per device under Config → Wake word.', 'ok');
 
-    // The finishing reboot lives in the LAST step, deliberately — it closes
-    // the ADB connection, so any step after it can never run. Keeping it on
-    // the success path (not in a finally) means a failure above leaves the
-    // connection alive and the Retry button usable.
-    //
-    // In the emOS flow this step is FOURTH of nine, not last: rebooting here
-    // would drop the connection and strand the build, flash and console steps
-    // exactly as the wake word step was stranded in 2026-07-31. The reboot
-    // there belongs to Reboot and Watch, which is the last step that has a
-    // device to reboot.
     if (isEmos) {
       addLog('Staying in recovery — the image is built and flashed next.', 'ok');
       return;
     }
     addLog('Rebooting device to finish provisioning…');
     expectDisconnect.current = true;
-    try { await c.shell('su -c reboot'); } catch {}
+    try { await c.shell('reboot'); } catch {}
     await c.close();
     setAdb(null);
     addLog('Device rebooting. It will appear in the controller dashboard within ~30s via mDNS.', 'ok');

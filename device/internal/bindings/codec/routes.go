@@ -62,17 +62,14 @@ type Write struct {
 // PLAYBACK: the DAC was not connected to the output mixer, so it powered down
 // with the firmware streaming correctly into it.
 var Routes = []Write{
-	{"ADC_D Right Ip Select ADC_D DIF1_R switch", "1"},
-	{"ADC_D Left Ip Select ADC_D DIF1_L switch", "1"},
-	{"ADC_C Right Ip Select ADC_C DIF1_R switch", "1"},
-	{"ADC_C Left Ip Select ADC_C DIF1_L switch", "1"},
 	{"ADC_B Right Ip Select ADC_B DIF1_R switch", "1"},
 	{"ADC_B Left Ip Select ADC_B DIF1_L switch", "1"},
 	{"ADC_A Right Ip Select ADC_A DIF1_R switch", "1"},
 	{"ADC_A Left Ip Select ADC_A DIF1_L switch", "1"},
-
-	{"HPR Output Mixer R_DAC Switch", "1"},
-	{"HPL Output Mixer L_DAC Switch", "1"},
+	{"O03 I05 Switch", "1"},
+	{"O04 I06 Switch", "1"},
+	{"I2S O03_O04 Switch", "1"},
+	{"INT ADDA O03_O04 Switch", "1"},
 }
 
 var once sync.Once

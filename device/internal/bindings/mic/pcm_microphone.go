@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"sync"
 	"time"
+	"os"
+	"strings"
 
 	"github.com/wilbowes/EchoMuse/internal/bindings/codec"
 	pkgmic "github.com/wilbowes/EchoMuse/pkg/mic"
@@ -17,7 +19,7 @@ import (
 )
 
 const cardNr = 0
-const deviceNr = 24
+const deviceNr = 1
 
 // rawTap receives every raw 9-channel batch, and is nil in release builds.
 // Only rawtap_bench.go sets it (build tag bench): it records the mics to
@@ -32,16 +34,74 @@ type PcmMicrophone struct {
 	subs   []chan []byte
 }
 
+// clockAnchor holds DL1_AWB_Record (the speaker loopback, 48 kHz) open for the
+// life of the process, and is started BEFORE the mic.
+//
+// Echo Dot 3rd gen (donut_puffin): the TDM mic capture and the I2S port that
+// feeds the TAS2770 speaker amp share an audio clock. Opening the mic at
+// 16 kHz with nothing else running configures that clock so the speaker port
+// cannot produce a valid 48 kHz frame; the amp latches a TDM clock error
+// (INT_LTCH0 bit 2) and shuts down, and it stays that way until a reboot.
+// Amazon's mixer avoids it by opening this 48 kHz loopback first, from the
+// same process, and so do we. Measured 2026-09-28: mic alone at 16 kHz breaks
+// the speaker; loopback first, then mic, both work.
+//
+// Returns immediately on boards where device 7 is something else.
+const awbDevice = 7
+
+func startClockAnchor() {
+	info, err := os.ReadFile("/proc/asound/card0/pcm7c/info")
+	if err != nil || !strings.Contains(string(info), "DL1_AWB_Record") {
+		return
+	}
+	dev := tinyalsa.NewDevice(cardNr, awbDevice, pcm.Config{
+		Channels:         2,
+		SampleRate:       48000,
+		PeriodSize:       768,
+		PeriodCount:      10,
+		Format:           tinyalsa.PCM_FORMAT_S16_LE,
+		StartThreshold:   768,
+		StopThreshold:    7680,
+		SilenceThreshold: 7680,
+	})
+	stream := make(chan []byte, 16)
+	ready := make(chan struct{})
+	go func() {
+		if err := dev.GetAudioStream(dev.DeviceConfig, stream); err != nil {
+			log.Printf("[mic] clock anchor (DL1_AWB_Record) stream error: %v", err)
+		}
+	}()
+	go func() {
+		first := true
+		for range stream { // drain forever; an overrun would stop the stream
+			if first {
+				close(ready)
+				first = false
+			}
+		}
+		log.Printf("[mic] clock anchor stream closed — speaker may lose its clock")
+	}()
+	select {
+	case <-ready:
+		log.Printf("[mic] clock anchor running (DL1_AWB_Record 48 kHz) — mic may open")
+	case <-time.After(2 * time.Second):
+		log.Printf("[mic] clock anchor did not start within 2s — opening mic anyway")
+	}
+}
+
 // NewMicrophone returns the pre-configured microphone alsa device and starts
 // the permanent ALSA read loop.
 func NewMicrophone() (*PcmMicrophone, error) {
-	device := tinyalsa.NewDevice(cardNr, deviceNr, pcm.Config{
-		Channels:    9,
-		SampleRate:  16000,
-		PeriodSize:  512,
-		PeriodCount: 5,
-		Format:      tinyalsa.PCM_FORMAT_S24_3LE,
-	})
+	device := tinyalsa.NewDevice(cardNr, 1, pcm.Config{
+        Channels:         4,
+        SampleRate:       16000,
+        PeriodSize:       256,
+        PeriodCount:      10,  // To yield buffer_size 2560
+        Format:           tinyalsa.PCM_FORMAT_S32_LE,
+        StartThreshold:   256,
+        StopThreshold:    2560,
+        SilenceThreshold: 2560,
+    })
 	m := &PcmMicrophone{
 		device: &device,
 	}
@@ -58,6 +118,9 @@ func (p *PcmMicrophone) Init() error {
 	if err := cmd.Run(); err != nil {
 		log.Printf("mic: stop mixer: %v (continuing)", err)
 	}
+
+	startClockAnchor()
+
 	// Route the differential mic inputs into the ADCs before opening the PCM.
 	// Without this the ADCs are powered down and capture returns the I2S bus's
 	// own noise floor — with a perfectly healthy ALSA clock, which is what
@@ -111,7 +174,7 @@ func (p *PcmMicrophone) readLoop() {
 	}()
 
 	rate := int64(p.device.DeviceConfig.SampleRate)
-	bytesPerFrame := p.device.DeviceConfig.Channels * 3 // S24_3LE
+	bytesPerFrame := p.device.DeviceConfig.Channels * 4 // S24_3LE
 	var (
 		firstArrival time.Time
 		lastArrival  time.Time

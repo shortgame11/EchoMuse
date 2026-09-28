@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"strings"
 
 	"github.com/wilbowes/EchoMuse/internal/bindings/codec"
 	"github.com/wilbowes/EchoMuse/internal/bindings/mixer"
@@ -164,38 +165,67 @@ func NewPcmSpeaker(echoTap func([]byte), levelTap func(rms float64)) (*PcmSpeake
 	return s, nil
 }
 
+// waitForCaptureClocks holds the speaker open until the mic capture and the
+// 48 kHz clock anchor (DL1_AWB_Record) are both running.
+//
+// Echo Dot 3rd gen: the speaker's I2S port shares its clock with the TDM mic
+// capture, and the port's clock settings are fixed when the speaker stream is
+// opened. Opened while the capture side is still starting, it runs with
+// invalid clocks for its whole lifetime: the TAS2770 latches a TDM clock error
+// and stays in shutdown (measured 2026-09-28: live INT 0x04 for as long as the
+// stream existed). Amazon's mixer and every working manual test had both
+// captures running before the speaker opened.
+//
+// The mic starts its capture on a goroutine, so being created first in main is
+// not enough. Gated on the anchor existing, so other boards open immediately.
+func waitForCaptureClocks() {
+	info, err := os.ReadFile("/proc/asound/card0/pcm7c/info")
+	if err != nil || !strings.Contains(string(info), "DL1_AWB_Record") {
+		return
+	}
+	running := func(path string) bool {
+		b, err := os.ReadFile(path)
+		return err == nil && strings.Contains(string(b), "state: RUNNING")
+	}
+	const mic = "/proc/asound/card0/pcm1c/sub0/status"
+	const awb = "/proc/asound/card0/pcm7c/sub0/status"
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if running(mic) && running(awb) {
+			time.Sleep(300 * time.Millisecond) // let the shared clock settle
+			log.Println("[speaker] mic and clock anchor running — opening speaker")
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	log.Println("[speaker] mic/clock anchor not running after 5s — opening speaker anyway")
+}
+
 func (p *PcmSpeaker) Init() error {
-	// Startup order matters for the audible click (2026-07-10): the amp
-	// must come up onto a DAC that is already clocking silence, and the
-	// unmute must come last. The old order (amp on → unmute → open PCM)
-	// unmuted a floating DAC and then hit it with the stream-open
-	// transient — the "click" on every service start.
 	exec.Command("stop", "mixer").Run()
-	// Android's media stack takes the speaker for itself when a headphone
-	// plug is present at boot, and ALSA parks a blocking open behind it with
-	// no timeout — stranding the whole device, since everything else in
-	// main() is initialised after the speaker (issue #80). Same stock-service
-	// takeover as `stop mixer` above and `stop smarthomewifid` in main: on a
-	// device where EchoMuse drives the codec directly, mediaserver has no
-	// work to do and is only ever in the way.
 	exec.Command("stop", "media").Run()
 	waitForFreePcm(cardNr, deviceNr, pcmFreeTimeout)
-	// Connect the DAC to the output mixer before opening the stream: DAPM
-	// decides what to power at stream open, and an unrouted DAC is powered
-	// down, which presents as a clean "voice stream complete, underruns=0"
-	// into silence. See the codec package.
 	codec.EnsureRoutes()
 	mixer.Set(mixer.PlaybackVolume, "0") // mute before touching amp or stream
+
+	// Routing in place BEFORE the stream starts: the TAS2770 is powered up only
+	// if its path is connected at stream start.
+	mixer.Set("Audio Amp Playback Volume", "0")
+	mixer.Set("Headset_PGAL_GAIN", "-2dB")
+	mixer.Set("Headset_PGAR_GAIN", "-2dB")
+	mixer.Set("LINEOUT Mux", "VOICE_AMP")
+
+	waitForCaptureClocks()
 
 	device := tinyalsa.NewDevice(cardNr, deviceNr, pcm.Config{
 		Channels:         2,
 		SampleRate:       48000,
-		PeriodSize:       alsaPeriodSize,
-		PeriodCount:      alsaPeriodCount,
+		PeriodSize:       768,
+		PeriodCount:      2,
 		Format:           tinyalsa.PCM_FORMAT_S16_LE,
-		StartThreshold:   alsaPeriodSize,
-		StopThreshold:    alsaBufferFrames,
-		SilenceThreshold: alsaBufferFrames,
+		StartThreshold:   768,
+		StopThreshold:    1536,
+		SilenceThreshold: 1536,
 	})
 
 	session, err := device.NewAudioSession()
@@ -205,11 +235,6 @@ func (p *PcmSpeaker) Init() error {
 	p.session = &session
 
 	go p.silenceLoop()
-
-	time.Sleep(100 * time.Millisecond)     // silence reaches the DAC (~2 periods)
-	mixer.Set(mixer.SpeakerAmp, "On")      // enable amp onto a clocked, silent DAC
-	time.Sleep(50 * time.Millisecond)      // let amp settle
-	mixer.Set(mixer.PlaybackVolume, "100") // unmute
 
 	log.Println("PcmSpeaker initialised — silence stream running")
 	return nil
@@ -617,11 +642,7 @@ func (p *PcmSpeaker) FlushMusic() { p.music.flush() }
 // amp-off after every server exit as a belt-and-braces for paths where
 // this never runs (SIGKILL, panic).
 func (p *PcmSpeaker) Close() {
-	mixer.Set(mixer.PlaybackVolume, "0") // mute
-	mixer.Set(mixer.SpeakerAmp, "Off")   // amp off
-	close(p.stopCh)
-	p.session.Close()
-	log.Println("PcmSpeaker closed — output muted, amp off")
+	mixer.Set(mixer.PlaybackVolume, "0")
 }
 
 // periodRMS computes the RMS level of a stereo S16LE period, normalized to

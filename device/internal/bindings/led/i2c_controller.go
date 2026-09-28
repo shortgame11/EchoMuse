@@ -10,20 +10,20 @@ import (
 )
 
 // i2C device that sets the current led
-const ledCurrentPath = "/sys/devices/soc/11007000.i2c/i2c-0/0-003f/led_current"
+const ledCurrentPath = "/sys/bus/i2c/devices/0-003f/led_current"
 
 // i2C device that seems to control brightness
-const privacyBrightnessPath = "/sys/devices/soc/10010000.keypad/amz_privacy/privacy_brightness"
+const privacyBrightnessPath = "/sys/bus/i2c/devices/0-003f/privacy_brightness"
 
 // i2C device that controls the actual LEDs
-const ledFrame = "/sys/devices/soc/11007000.i2c/i2c-0/0-003f/frame"
+const ledFrame = "/sys/bus/i2c/devices/0-003f/frame"
 
 // The is31fl3236 driver animates the ring itself from boot until something
 // clears this. Android's userspace does; ours does not, so on a device running
 // our own init the kernel animation and our frames drive the same LEDs over the
 // same i2C device and the ring visibly glitches. Reads 1 under our userspace and
 // 0 on stock.
-const bootAnimationPath = "/sys/devices/soc/11007000.i2c/i2c-0/0-003f/boot_animation"
+const bootAnimationPath = "/sys/bus/i2c/devices/0-003f/boot_animation"
 
 // file permission we need to access the i2C device
 const perm = os.FileMode(0644)

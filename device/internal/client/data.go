@@ -366,13 +366,11 @@ func (d *DataClient) noteEchoRef(ref []byte) bool {
 		// make the comparison a one-way trip.
 		if d.hwRefOn {
 			d.hwRefOn = false
-			d.aec.SetHardwareRef(false)
 		}
 		return false
 	case hwRefForceHW:
 		if !d.hwRefOn {
 			d.hwRefOn = true
-			d.aec.SetHardwareRef(true)
 		}
 		return true
 	}
@@ -396,7 +394,6 @@ func (d *DataClient) noteEchoRef(ref []byte) bool {
 	}
 	if d.hwRefSeenSilent && d.hwRefSeenAudio {
 		d.hwRefOn = true
-		d.aec.SetHardwareRef(true)
 		log.Printf("[aec] ch8 confirmed as the playback loopback " +
 			"(bit-exact silent when idle, audio when playing) — " +
 			"using the frame-aligned hardware reference")
@@ -1171,15 +1168,7 @@ func (d *DataClient) streamMic(conn *websocket.Conn, stopCh <-chan struct{}, loc
 			// Only extract when cancellation is actually armed: the AEC
 			// defaults to off, and this is an allocation and a copy per
 			// period on the deadline-bound mic goroutine.
-			var echoRef []byte
-			if d.aec.Enabled() {
-				echoRef = d.beam.EchoRef(raw)
-			}
-			if echoRef != nil && d.noteEchoRef(echoRef) {
-				mono = d.aec.ProcessWithRef(mono, echoRef)
-			} else {
-				mono = d.aec.Process(mono)
-			}
+			mono = d.aec.Process(mono)
 
 			// ── Processing pipeline ──────────────────────────────────────
 			// VAD on raw beamformed output — pre-NS/AGC so threshold is

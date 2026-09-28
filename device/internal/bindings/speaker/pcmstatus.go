@@ -6,11 +6,11 @@ import (
 	"strings"
 )
 
-// The speaker is card 0 device 23; the mic is device 24. Here rather than in
+// The speaker is card 0 device 6; the mic is device 7. Here rather than in
 // pcm_speaker.go because that file is ARM-only (build tag `server`) and the
 // status-path test needs to pin these on the host.
 const cardNr = 0
-const deviceNr = 23
+const deviceNr = 6
 
 // The playback substream's status file, which is how we find out whether
 // anyone else holds the speaker BEFORE trying to open it.

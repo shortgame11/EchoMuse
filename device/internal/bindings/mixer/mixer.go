@@ -20,12 +20,17 @@ import (
 	"sync"
 )
 
-// Control names on biscuit. Measured present, and unique, on the FireOS 5 and
-// FireOS 6 kernels (2026-09-17).
+// Control names mapped for MediaTek mt-snd-card (Gen 3 Echo Dot)
 const (
-	SpeakerAmp     = "Ext_Speaker_Amp_Switch"
-	PlaybackVolume = "PCM Playback Volume" // DAC digital volume, 0.5dB steps, 127 = 0dB
-	HPDriverGain   = "HP Driver Gain Volume"
+    // Replaces the Gen 2 Ext_Speaker_Amp_Switch boolean. 
+    // The Set() function will automatically spread a "1" or "0" across both channels of this INT control.
+    SpeakerAmp     = "Audio Amp Playback Volume" 
+    
+    // Fortunately, MediaTek kept the exact same name for the main digital volume!
+    PlaybackVolume = "PCM Playback Volume" 
+    
+    // Maps the old headphone driver gain to the MediaTek Lineout PGA
+    HPDriverGain   = "Lineout_PGA_GAIN"
 )
 
 // Backend is the device implementation. Values are strings as tinymix prints

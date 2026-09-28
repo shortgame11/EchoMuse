@@ -33,7 +33,7 @@ type Board struct {
 var Biscuit = &Board{
 	ID:           "biscuit",
 	DeviceTypeID: "A3S5BH2HU6VAYF",
-	Tuning:       biscuitTuning,
+	Tuning:       nil,
 }
 
 // Known is every board the firmware can identify.

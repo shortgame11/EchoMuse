@@ -38,7 +38,7 @@ func (c *Canceller) SetStatePath(path string) {
 // loadStateLocked loads the saved echo path into a freshly built
 // hardware-path filter. One small file read, once per boot.
 func (c *Canceller) loadStateLocked() {
-	if c.statePath == "" || !c.hwRef || c.st == nil {
+	if c.statePath == "" || c.st == nil {
 		return
 	}
 	b, err := os.ReadFile(c.statePath)
@@ -60,7 +60,7 @@ func (c *Canceller) loadStateLocked() {
 // 16KB copy under the lock; the file write runs on its own goroutine so the
 // mic goroutine never waits on flash.
 func (c *Canceller) maybeSaveLocked(attDb float64, playing bool) {
-	if c.statePath == "" || !c.hwRef || !playing || attDb < saveMinDb {
+	if c.statePath == "" || !playing || attDb < saveMinDb {
 		return
 	}
 	if !c.lastSaveTry.IsZero() && time.Since(c.lastSaveTry) < saveEvery {

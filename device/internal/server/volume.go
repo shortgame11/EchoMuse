@@ -5,10 +5,47 @@ import (
 	"strconv"
 	"sync"
 	"time"
+	"os"
+	"strings"
 
 	"github.com/wilbowes/EchoMuse/internal/bindings/mixer"
 	"github.com/wilbowes/EchoMuse/pkg/led"
 )
+
+// tasAmp reports whether the speaker is the Echo Dot 3rd gen's TAS2770.
+//
+// On that board "PCM Playback Volume" is not a codec DAC volume but the
+// TAS2770's digital volume, INVERTED and wider: 0..255, where 255 = 0 dB,
+// each step down is -0.5 dB, and 0 is mute (measured 2026-09-28: 255 reads
+// back as amp register 0x05 = 0x00). The controller's 0..127 scale is
+// dB-linear with 127 = 0 dB, so the same dB value is simply level+128.
+// Writing the raw level instead left the amp at -77 dB at "normal" volume.
+var tasAmp = func() bool {
+	b, _ := os.ReadFile("/sys/bus/i2c/devices/2-0044/name")
+	return strings.TrimSpace(string(b)) == "tas2770"
+}()
+
+// toControl converts a volume level (0..volumeMax) to the mixer value.
+func toControl(level int) int {
+	if !tasAmp {
+		return level
+	}
+	if level <= 0 {
+		return 0 // amp mute: HA's 0.0 must still mean silent
+	}
+	return level + 128
+}
+
+// fromControl is the inverse, for reading the current volume back.
+func fromControl(v int) int {
+	if !tasAmp {
+		return v
+	}
+	if v <= 128 {
+		return 0
+	}
+	return v - 128
+}
 
 const (
 	volumeMin = 0
@@ -124,6 +161,7 @@ func (vc *volumeController) readFromDevice() int {
 		log.Printf("Volume parse failed: %v", err)
 		return fallback
 	}
+	l = fromControl(l) 
 	if l > volumeMax {
 		l = volumeMax
 	}
@@ -153,7 +191,7 @@ func (vc *volumeController) Set(level int, showRing bool) {
 	vc.mu.Unlock()
 
 	// Apply to ALSA
-	if err := mixer.Set(mixer.PlaybackVolume, strconv.Itoa(level)); err != nil {
+		if err := mixer.Set(mixer.PlaybackVolume, strconv.Itoa(toControl(level))); err != nil {
 		log.Printf("Volume set failed: %v", err)
 	}
 

@@ -55,58 +55,28 @@ const (
 	tzcpuPath = "/proc/driver/thermal/tzcpu"
 )
 
-// biscuitTuning is stock FireOS 5's policy, read off a stock device and out of
-// /system/etc/.tp (MediaTek's obfuscated thermal.conf, and Amazon's plaintext
-// thermal.policy.conf). The kernel defaults emOS otherwise runs are STRICTER:
-// CPU throttling from 65°C rather than 84°C, the board sensor from 50.25°C
-// rather than 56.5°C. The FireOS 6 kernel also scales cores at 50/30%.
-//
-// Stock's /proc/mtkcooler/cpu_adaptive_* writes are left out: they read back
-// "error" on the stock device itself.
-var biscuitTuning = &Tuning{
-	Values: []Value{
-		{"/proc/hps/up_threshold", "80"},
-		{"/proc/hps/down_threshold", "70"},
-	},
-	Proc: []ProcWrite{
-		{
-			Path: "/proc/driver/thermal/clatm_setting",
-			Lines: []string{
-				"0 3000 15 30 50 900 4000 600 2100",
-				"1 2000 15 30 50 900 4000 600 2100",
-				"2 1500 15 30 50 900 4000 600 2100",
-			},
-			Expect: []string{
-				"cpu_adaptive_00 first_step = 3000 theta rise = 15 theta fall = 30 min_budget_change = 50 m cpu = 900 M cpu = 4000 m gpu = 600 M gpu = 2100",
-				"cpu_adaptive_01 first_step = 2000 theta rise = 15 theta fall = 30 min_budget_change = 50 m cpu = 900 M cpu = 4000 m gpu = 600 M gpu = 2100",
-				"cpu_adaptive_02 first_step = 1500 theta rise = 15 theta fall = 30 min_budget_change = 50 m cpu = 900 M cpu = 4000 m gpu = 600 M gpu = 2100",
-			},
-		},
-		{
-			// count, then ten (trip, type, cooler), then poll ms and a flag
-			Path: tzcpuPath,
-			Lines: []string{
-				"5 117000 0 mtktscpu-sysrst 100000 0 cpu02 86000 0 cpu_adaptive_0 85000 0 cpu_adaptive_1 84000 0 cpu_adaptive_2" +
-					strings.Repeat(" 0 0 no-cooler", 5) + " 250 1",
-			},
-			Expect: []string{
-				"trip_0=117000 0 mtktscpu-sysrst trip_1=100000 0 cpu02 trip_2=86000 0 cpu_adaptive_0 trip_3=85000 0 cpu_adaptive_1 trip_4=84000 0 cpu_adaptive_2",
-				"interval=250",
-			},
-		},
-	},
-	ZoneTrips: []ZoneTrips{{
-		Zone:  "tmp103",
-		Trips: map[int]int{0: 56500, 1: 57000, 2: 57500, 3: 58000, 4: 58500, 5: 59000},
-	}},
-	CoolerLevels: []CoolerLevels{{
-		Cooler: "thermal_budget",
-		Levels: map[int]int{0: 2950, 1: 1958, 2: 1520, 3: 1090, 4: 574, 5: 251},
-	}},
-	Coolers: []string{
-		"mtktscpu-sysrst", "cpu02", "cpu_adaptive_0", "cpu_adaptive_1", "cpu_adaptive_2",
-		"thermal_budget",
-	},
+// donutTuning is the thermal policy for the Echo Dot 3 (MT8167B).
+// CoolerLevels and Proc writes should be populated by reading off a stock FireOS 6 device.
+var donutTuning = &Tuning{
+    ZoneTrips: []ZoneTrips{
+        {
+            Zone:  "skin_virtual",
+            Trips: map[int]int{0: 56000, 1: 57000, 2: 58000, 3: 59000, 4: 60000, 5: 61000, 6: 71000},
+        },
+        {
+            Zone:  "case_virtual",
+            Trips: map[int]int{0: 55000, 1: 56000, 2: 57000, 3: 58000, 4: 59000, 5: 60000, 6: 70000},
+        },
+        {
+            Zone:  "mtktscpu",
+            Trips: map[int]int{0: 90000, 1: 93000, 2: 96000, 3: 99000, 4: 102000, 5: 105000, 6: 107000, 7: 110000, 8: 115000},
+        },
+    },
+    Coolers: []string{
+        "mtktscpu-sysrst", "cpu_adaptive_0", "cpu_adaptive_1", "cpu_adaptive_2",
+        "thermal-cpufreq-0", "audio_cooler", "led_cooler", "suspend_cooler", "wifi",
+    },
+    // Populate Proc and CoolerLevels here once dumped from a stock device
 }
 
 // Apply writes t beneath root and verifies it. Everything the profile touches

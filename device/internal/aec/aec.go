@@ -134,33 +134,6 @@ type Canceller struct {
 
 	sizeWarned bool // one-shot guard for the unsupported-buffer-size log
 
-	// Hardware far-end reference (#385). When set, the reference comes from
-	// ch8 of the mic capture — the device's own playback, looped back in the
-	// SAME TDM frame as the near-end samples — and the ring, the decimator,
-	// aecDelayMs and the occupancy governor are all bypassed, because every
-	// one of them exists to answer "where in time is the far end", which
-	// arriving in the same frame answers by construction.
-	//
-	// Owned here rather than decided at the call site so WriteFar and
-	// ProcessWithRef cannot disagree about which source is live: a period
-	// pushed into the ring while the hardware path is running would be
-	// consumed by nothing and sit there aging.
-	hwRef bool
-	// Periods cancelled against a hardware reference, and periods where one
-	// was expected and did not arrive (nil, or a length mismatch with the
-	// near end). A rising hwMissing with cancellation on is an extraction
-	// fault, not a filter one, and the attenuation line alone cannot tell
-	// them apart — those frames pass through uncancelled and simply read as
-	// att≈0dB.
-	//
-	// Deliberately NOT a silence counter. A reference that is present and
-	// all-zero is the correct state whenever nothing is playing, so counting
-	// it would be counting idle; the case worth catching — zero WHILE the
-	// speaker plays — is already visible as ref=0 against a loud mic on the
-	// once-a-second attenuation line.
-	hwFrames  uint64
-	hwMissing uint64
-
 	// Playback gain the hardware reference has NOT been through, as a linear
 	// scalar (1.0 = the codec's unity gain, index 127). Measured on hardware:
 	// the loopback is tapped upstream of the DAC volume control, so it holds
@@ -204,43 +177,9 @@ func (c *Canceller) SetPlaybackLevel(level int) {
 		level, scale, 20*math.Log10(math.Max(scale, 1e-9)))
 }
 
-// SetHardwareRef selects the far-end source. True takes it from ch8 of the
-// mic capture; false uses the software tap at the speaker ALSA write.
-//
-// Switching drops any ring contents: on the way in they would never be
-// consumed, and on the way out they are stale by however long the hardware
-// path ran. The filter is kept only when both paths want the same length;
-// normally they do not (hwTailMs), and it is rebuilt.
-func (c *Canceller) SetHardwareRef(on bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.hwRef == on {
-		return
-	}
-	c.hwRef = on
-	c.head, c.tail, c.count = 0, 0, 0
-	c.dsum, c.dcnt = 0, 0
-	log.Printf("[aec] far-end reference: %s",
-		map[bool]string{true: "hardware (ch8, frame-aligned)",
-			false: "software tap (ring + aecDelayMs)"}[on])
-	// The two paths want different filter lengths (hwTailMs). A rebuild
-	// discards what was learnt, which on the way in is almost nothing: the
-	// hardware reference is confirmed by the first playback after boot.
-	if c.st != nil && c.effectiveTailLocked() != c.stTailMs {
-		c.buildLocked()
-		if !on {
-			c.seedRingLocked() // nothing drains the ring on the hardware path
-		}
-		c.loadStateLocked()
-	}
-}
-
 // effectiveTailLocked is the filter length for the reference in use.
 func (c *Canceller) effectiveTailLocked() int {
-	if c.hwRef {
-		return hwTailMs
-	}
-	return c.tailMs
+    return c.tailMs
 }
 
 // Enabled reports whether cancellation is armed. Callers use it to skip
@@ -257,12 +196,6 @@ func (c *Canceller) Enabled() bool {
 	return c.enabled
 }
 
-// HardwareRef reports the current far-end source.
-func (c *Canceller) HardwareRef() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.hwRef
-}
 
 // RefSource names the far-end reference in use, for the stats report:
 // "hw" once ch8 has proved itself the playback loopback, "sw" for the tap at
@@ -272,16 +205,12 @@ func (c *Canceller) HardwareRef() bool {
 // aecRef as "firmware too old to say", and an empty string arriving as a
 // fourth value would collapse that distinction.
 func (c *Canceller) RefSource() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	switch {
-	case !c.enabled:
-		return "off"
-	case c.hwRef:
-		return "hw"
-	default:
-		return "sw"
-	}
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    if !c.enabled {
+        return "off"
+    }
+    return "sw"
 }
 
 // New returns a disabled Canceller. Call SetParams (config push) to arm it.
@@ -294,49 +223,37 @@ func New() *Canceller {
 // worthless across a timing change anyway. Called from the control goroutine
 // on config push.
 func (c *Canceller) SetParams(enabled bool, delayMs, tailMs int) {
-	if delayMs < 0 {
-		delayMs = 0
-	}
-	if delayMs > maxDelayMs {
-		delayMs = maxDelayMs
-	}
-	if tailMs < minTailMs {
-		tailMs = minTailMs
-	}
-	if tailMs > maxTailMs {
-		tailMs = maxTailMs
-	}
+    if delayMs < 0 {
+        delayMs = 0
+    }
+    if delayMs > maxDelayMs {
+        delayMs = maxDelayMs
+    }
+    if tailMs < minTailMs {
+        tailMs = minTailMs
+    }
+    if tailMs > maxTailMs {
+        tailMs = maxTailMs
+    }
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+    c.mu.Lock()
+    defer c.mu.Unlock()
 
-	if enabled == c.enabled && delayMs == c.delayMs && tailMs == c.tailMs {
-		return
-	}
-	// Delay and tail changes are no-ops on the hardware reference. delayMs
-	// only seeds the ring, and aecTailMs sets the software tap's length
-	// (hwTailMs is used here), so a rebuild would discard a converged filter
-	// to apply numbers nothing reads. That is not hypothetical: both ride
-	// every config push, so one fleet-wide edit would reset cancellation on
-	// every device using the hardware reference.
-	//
-	// Stored anyway, so a later fall back to the software tap uses the
-	// operator's current settings rather than stale ones.
-	if c.hwRef && c.st != nil && enabled == c.enabled {
-		c.delayMs, c.tailMs = delayMs, tailMs
-		return
-	}
-	c.enabled = enabled
-	c.delayMs = delayMs
-	c.tailMs = tailMs
-	if !enabled {
-		c.freeLocked()
-		log.Printf("[aec] disabled")
-		return
-	}
-	c.buildLocked()
-	c.seedRingLocked()
-	c.loadStateLocked()
+    if enabled == c.enabled && delayMs == c.delayMs && tailMs == c.tailMs {
+        return
+    }
+
+    c.enabled = enabled
+    c.delayMs = delayMs
+    c.tailMs = tailMs
+    if !enabled {
+        c.freeLocked()
+        log.Printf("[aec] disabled")
+        return
+    }
+    c.buildLocked()
+    c.seedRingLocked()
+    c.loadStateLocked()
 }
 
 // buildLocked (re)creates the echo state at the length for the reference in
@@ -399,12 +316,7 @@ func (c *Canceller) WriteFar(period []byte) {
 	if !c.enabled {
 		return
 	}
-	if c.hwRef {
-		// Nothing drains the ring on the hardware path, so filling it would
-		// peg it at ringCap and leave the far-end telemetry describing a
-		// buffer no cancellation ever reads.
-		return
-	}
+
 	n := len(period) / 4 // frames (2ch × 2 bytes)
 	for i := 0; i < n; i++ {
 		l := int16(binary.LittleEndian.Uint16(period[i*4:]))
@@ -451,200 +363,94 @@ func (c *Canceller) WriteFar(period []byte) {
 // it away) while the unit tests, which feed single frames, showed 42dB.
 // Hence: any size this function cannot handle is LOGGED, never silently
 // bypassed. Called from the mic goroutine.
+// Process runs echo cancellation on one mic buffer: 16kHz mono S16LE, any
+// multiple of FrameSize samples. 
 func (c *Canceller) Process(mono []byte) []byte {
-	return c.process(mono, nil)
-}
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    if !c.enabled || c.st == nil {
+        return mono
+    }
 
-// ProcessWithRef cancels using a far-end reference supplied by the CALLER,
-// taken from ch8 of the same raw mic period (#385). Both streams therefore
-// come off one ADC clock in one TDM frame, so alignment is structural rather
-// than inferred: the residual is the +33-sample (2.06ms) converter and
-// acoustic delay measured on hardware, which sits far inside the filter tail
-// and is absorbed like any other room delay. The measured polarity inversion
-// is likewise learned by the filter.
-//
-// hwRef must be set (SetHardwareRef) or this falls back to the ring, so that
-// a caller and the canceller cannot disagree about which reference is live.
-// A nil or short ref is treated as "no reference this period" and the frame
-// passes through uncancelled rather than being cancelled against silence —
-// which would be indistinguishable from a working AEC with nothing playing.
-func (c *Canceller) ProcessWithRef(mono, ref []byte) []byte {
-	return c.process(mono, ref)
-}
+    if len(mono) == 0 || len(mono)%(FrameSize*2) != 0 {
+        if !c.sizeWarned {
+            c.sizeWarned = true
+            log.Printf(
+                "[aec] mic buffer %db is not a multiple of the %db speex frame — AEC BYPASSED",
+                len(mono), FrameSize*2,
+            )
+        }
+        return mono
+    }
 
-func (c *Canceller) process(mono, hwref []byte) []byte {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.enabled || c.st == nil {
-		return mono
-	}
-	// The hardware path is only taken when both sides agree it is live and
-	// the caller actually supplied a matching period.
-	useHW := c.hwRef && hwref != nil && len(hwref) == len(mono)
-	if c.hwRef && !useHW {
-		// Counted, not logged per period: at 31 periods/s a log line here
-		// would bury the very telemetry used to diagnose it.
-		c.hwMissing++
-		if c.hwMissing == 1 || c.hwMissing%256 == 0 {
-			log.Printf("[aec] hardware reference missing or mismatched "+
-				"(mic %db, ref %db, occurrences=%d) — frames passed through",
-				len(mono), len(hwref), c.hwMissing)
-		}
-		return mono
-	}
-	if len(mono) == 0 || len(mono)%(FrameSize*2) != 0 {
-		if !c.sizeWarned {
-			c.sizeWarned = true
-			log.Printf(
-				"[aec] mic buffer %db is not a multiple of the %db speex frame — AEC BYPASSED",
-				len(mono), FrameSize*2,
-			)
-		}
-		return mono
-	}
+    out := make([]byte, len(mono))
+    mic := unsafe.Slice((*int16)(unsafe.Pointer(c.micBuf)), FrameSize)
+    ref := unsafe.Slice((*int16)(unsafe.Pointer(c.refBuf)), FrameSize)
+    res := unsafe.Slice((*int16)(unsafe.Pointer(c.outBuf)), FrameSize)
 
-	out := make([]byte, len(mono))
-	mic := unsafe.Slice((*int16)(unsafe.Pointer(c.micBuf)), FrameSize)
-	ref := unsafe.Slice((*int16)(unsafe.Pointer(c.refBuf)), FrameSize)
-	res := unsafe.Slice((*int16)(unsafe.Pointer(c.outBuf)), FrameSize)
+    for off := 0; off < len(mono); off += FrameSize * 2 {
+        sub := mono[off : off+FrameSize*2]
+        for i := 0; i < FrameSize; i++ {
+            mic[i] = int16(binary.LittleEndian.Uint16(sub[i*2:]))
+        }
 
-	for off := 0; off < len(mono); off += FrameSize * 2 {
-		sub := mono[off : off+FrameSize*2]
-		for i := 0; i < FrameSize; i++ {
-			mic[i] = int16(binary.LittleEndian.Uint16(sub[i*2:]))
-		}
-		short := 0
-		if useHW {
-			// Same frame, same clock — a straight copy, no ring, no delay
-			// bookkeeping. This is the whole point of #385.
-			hsub := hwref[off : off+FrameSize*2]
-			// Unity if nobody has told us the volume yet. That should not
-			// happen — cmd/server.go seeds the level from the device's own
-			// tinymix reading as it wires the callback, before the control
-			// client dials — but unity is the least-wrong guess, since a
-			// zero reference cancels nothing and looks identical to a
-			// working AEC with nothing playing.
-			//
-			// It is warned about because it is not free: the device boots
-			// at whatever level the previous run left in tinymix, and if
-			// that is (say) index 60, an unscaled reference is 33dB hot and
-			// cancellation collapses exactly as it did in round one.
-			scale := c.refScale
-			if scale <= 0 {
-				scale = 1.0
-				if !c.scaleWarned {
-					c.scaleWarned = true
-					log.Printf("[aec] no playback level yet — hardware " +
-						"reference running unscaled; cancellation will be " +
-						"poor at any volume below unity")
-				}
-			}
-			for i := 0; i < FrameSize; i++ {
-				v := float64(int16(binary.LittleEndian.Uint16(hsub[i*2:]))) * scale
-				// The scalar only ever attenuates (level <= 127 by
-				// DEVICE_VOLUME_MAX), so this cannot clip in practice —
-				// clamped anyway because a future ceiling change must not
-				// silently wrap the reference to full-scale opposite sign.
-				if v > 32767 {
-					v = 32767
-				} else if v < -32768 {
-					v = -32768
-				}
-				ref[i] = int16(v)
-			}
-			c.hwFrames++
-		} else {
-			for i := 0; i < FrameSize; i++ {
-				if c.count > 0 {
-					ref[i] = c.ring[c.tail]
-					c.tail = (c.tail + 1) % ringCap
-					c.count--
-				} else {
-					ref[i] = 0
-					short++
-				}
-			}
-		}
-		if short > 0 {
-			c.underruns++
-			if c.underruns == 1 || c.underruns%256 == 0 {
-				log.Printf("[aec] reference underrun (%d samples short, total underruns=%d)", short, c.underruns)
-			}
-		}
+        short := 0
+        for i := 0; i < FrameSize; i++ {
+            if c.count > 0 {
+                ref[i] = c.ring[c.tail]
+                c.tail = (c.tail + 1) % ringCap
+                c.count--
+            } else {
+                ref[i] = 0
+                short++
+            }
+        }
 
-		C.speex_echo_cancellation(c.st, c.micBuf, c.refBuf, c.outBuf)
-		for i := 0; i < FrameSize; i++ {
-			binary.LittleEndian.PutUint16(out[off+i*2:], uint16(res[i]))
-		}
+        if short > 0 {
+            c.underruns++
+            if c.underruns == 1 || c.underruns%256 == 0 {
+                log.Printf("[aec] reference underrun (%d samples short, total underruns=%d)", short, c.underruns)
+            }
+        }
 
-		// Attenuation telemetry: fires while the speaker is playing
-		// (reference above the silence floor) — and also when the mic is
-		// loud with a quiet reference, the broken state this telemetry was
-		// built to catch. ~1 line/s of active audio.
-		refRMS := frameRMS(ref)
-		micRMS := frameRMS(mic)
-		if refRMS > 100 || micRMS > 500 { // int16 units; idle floor is well below both
-			c.statFrames++
-			c.statInSum += micRMS
-			c.statOutSum += frameRMS(res)
-			c.statRefSum += refRMS
-			if c.statFrames == 32 { // 32 × 32ms ≈ 1s
-				inAvg, outAvg, refAvg := c.statInSum/32, c.statOutSum/32, c.statRefSum/32
-				att := 0.0
-				if outAvg > 0 {
-					att = 20 * math.Log10(inAvg/outAvg)
-				}
-				if useHW {
-					log.Printf("[aec] att=%.1fdB mic=%.0f out=%.0f ref=%.0f "+
-						"src=hw(ch8) frames=%d",
-						att, inAvg, outAvg, refAvg, c.hwFrames)
-					c.maybeSaveLocked(att, refAvg > 100)
-				} else {
-					log.Printf("[aec] att=%.1fdB mic=%.0f out=%.0f ref=%.0f ring=%d (delay=%dms)",
-						att, inAvg, outAvg, refAvg, c.count, c.delayMs)
-				}
-				c.statFrames, c.statInSum, c.statOutSum, c.statRefSum = 0, 0, 0, 0
-			}
-		}
-	}
+        C.speex_echo_cancellation(c.st, c.micBuf, c.refBuf, c.outBuf)
+        for i := 0; i < FrameSize; i++ {
+            binary.LittleEndian.PutUint16(out[off+i*2:], uint16(res[i]))
+        }
 
-	// Occupancy governor: the ring must sit at ~delaySamples. WriteFar fills
-	// it continuously (every speaker period, silence included — that's what
-	// keeps the reference clock advancing), but this consumer stops whenever
-	// the mic stream does — and the mic stream is stopped/restarted around
-	// every voice turn. Each ~1s gap leaves ~16k unconsumed samples behind;
-	// production and consumption rates are identical, so the backlog never
-	// drains on its own — it compounds per turn until the ring pegs at
-	// ringCap and the reference runs a full 3s behind the echo. Trimming
-	// back to the nominal delay makes every gap self-heal within one call.
-	// Runs AFTER the consume loop (the low-water point): the mic delivers
-	// bursty 160ms batches, so occupancy measured before consuming swings
-	// by a whole batch and would need slack so wide it re-opens the stale
-	// window. Slack of 4 speex frames (128ms) clears producer/consumer
-	// phase jitter (~±1 speaker period ≈ 43ms). The filter state is KEPT
-	// across the trim: trimming restores the nominal delaySamples alignment
-	// — the same alignment the filter converged against — and the physical
-	// echo path hasn't changed, so the learned filter is still valid.
-	// (2026-07-10: the reset that used to live here was the barge-in
-	// killer — mic capture overruns trip this governor every ~20s in
-	// steady state, incl. mid-playback, and each reset threw away a
-	// converged filter for a ≤43ms alignment shift speexdsp tracks fine.)
-	// Not on the hardware path: there is no ring to trim, delayMs means
-	// nothing there, and leaving this running would log resyncs about a
-	// buffer nothing is filling.
-	if useHW {
-		return out
-	}
-	delaySamples := c.delayMs * sampleRate / 1000
-	if c.count > delaySamples+4*FrameSize {
-		drop := c.count - delaySamples
-		c.tail = (c.tail + drop) % ringCap
-		c.count = delaySamples
-		c.resyncs++
-		log.Printf("[aec] reference resync: dropped %d stale samples, filter kept (resyncs=%d)", drop, c.resyncs)
-	}
+        refRMS := frameRMS(ref)
+        micRMS := frameRMS(mic)
+        if refRMS > 100 || micRMS > 500 {
+            c.statFrames++
+            c.statInSum += micRMS
+            c.statOutSum += frameRMS(res)
+            c.statRefSum += refRMS
+            if c.statFrames == 32 { 
+                inAvg, outAvg, refAvg := c.statInSum/32, c.statOutSum/32, c.statRefSum/32
+                att := 0.0
+                if outAvg > 0 {
+                    att = 20 * math.Log10(inAvg/outAvg)
+                }
+                
+                log.Printf("[aec] att=%.1fdB mic=%.0f out=%.0f ref=%.0f ring=%d (delay=%dms)",
+                    att, inAvg, outAvg, refAvg, c.count, c.delayMs)
+                
+                c.maybeSaveLocked(att, refAvg > 100)
+                c.statFrames, c.statInSum, c.statOutSum, c.statRefSum = 0, 0, 0, 0
+            }
+        }
+    }
 
-	return out
+    delaySamples := c.delayMs * sampleRate / 1000
+    if c.count > delaySamples+4*FrameSize {
+        drop := c.count - delaySamples
+        c.tail = (c.tail + drop) % ringCap
+        c.count = delaySamples
+        c.resyncs++
+        log.Printf("[aec] reference resync: dropped %d stale samples, filter kept (resyncs=%d)", drop, c.resyncs)
+    }
+
+    return out
 }
 
 func frameRMS(s []int16) float64 {

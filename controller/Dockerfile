@@ -6,7 +6,7 @@
 # and it is the file measured on VVV. MIT licensed.
 FROM python:3.12-slim@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9 AS silero
 COPY tools/silero_typed.py /tmp/
-RUN pip install --no-cache-dir --root-user-action=ignore onnx==1.20.1 && \
+RUN pip install --no-cache-dir --root-user-action=ignore "numpy<2" onnx==1.20.1 && \
     python -c "import urllib.request; urllib.request.urlretrieve('https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/silero_vad.onnx', '/tmp/in.onnx')" && \
     echo "a35ebf52fd3ce5f1469b2a36158dba761bc47b973ea3382b3186ca15b1f5af28  /tmp/in.onnx" | sha256sum -c - && \
     python /tmp/silero_typed.py /tmp/in.onnx /silero_vad.onnx && \
@@ -54,10 +54,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # local GPU build (the published image is CPU-only and never runs this
 # line), which is why it sat here unnoticed until 2026-08-10.
 ARG GPU=0
-RUN if [ "$GPU" = "1" ]; then \
-      pip uninstall -y onnxruntime && \
-      pip install --no-cache-dir onnxruntime-gpu==1.20.2; \
-    fi
 # Install openwakeword without deps — tflite-runtime has no Python 3.12
 # x86_64 build; onnxruntime handles inference instead
 RUN pip install --no-cache-dir --no-deps openwakeword==0.6.0 && \

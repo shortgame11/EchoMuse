@@ -5,7 +5,7 @@
 //
 // 6 perimeter mics at r=36mm, 60° intervals, 30° offset from 12 o'clock.
 // 1 centre mic. Ch7 and Ch8 are NOT mics: they are a stereo loopback of the
-// device's own playback — the hardware echo reference (see echoRefCh below
+// device's own playback — the hardware echo reference (se below
 // and SETUP.md's Mic Array section, measured 2026-08-29).
 //
 //	Ch0 → MK1 → 330°  (11 o'clock)  confirmed empirically 2026-05
@@ -55,26 +55,17 @@ import (
 
 const (
 	// ALSA stream parameters — must match pcm_microphone.go
-	nChannels    = 9
+	nChannels    = 4
 	sampleRate   = 16000
-	byteSample   = 3 // S24_3LE
-	frameSize    = nChannels * byteSample // 27 bytes per frame
-	periodFrames = 512
+	byteSample   = 4 // S24_3LE
+	frameSize    = 16 // 27 bytes per frame
+	periodFrames = 256
 
 	// Number of candidate steering directions — one per perimeter mic
-	nDirections = 6
+	nDirections = 3
 
 	// Centre mic channel — used for wake word detection (omnidirectional)
-	centreCh = 6
-
-	// Hardware echo reference — NOT a microphone. Ch7 and Ch8 are a stereo
-	// loopback of the device's own playback, arriving in the same TDM frame
-	// as the mic samples, and the internal driver plays the RIGHT channel
-	// only (measured 2026-08-29: left silent gives 55dB less at the mic; see
-	// SETUP.md's Mic Array section). So ch8 is the reference and ch7 carries
-	// a signal the speaker never emits — using ch7 would be cancelling
-	// against audio nobody heard.
-	echoRefCh = 8
+	centreCh = 3
 
 	// Smoothing constants
 	smoothAlpha   = 0.9    // fast smoother (~320ms time constant at 32ms/period)
@@ -93,31 +84,26 @@ const (
 
 // micAngles defines the physical angle (degrees, clockwise from 12 o'clock)
 // for each ALSA channel. Index = channel number.
-// Confirmed empirically 2026-05 via tone injection + analyse_capture.py.
-var micAngles = [7]float64{
-	330, // ch0 — MK1
-	30,  // ch1 — MK2
-	90,  // ch2 — MK3
-	150, // ch3 — MK4
-	210, // ch4 — MK5
-	270, // ch5 — MK6
-	0,   // ch6 — MK7 centre
+// Assuming a standard 120-degree triangular layout for the 3 perimeter mics.
+// Note: You may need to confirm the exact rotational offset (e.g., 0° vs 30°) empirically.
+var micAngles = [4]float64{
+    0,   // ch0 — Perimeter 1
+    120, // ch1 — Perimeter 2
+    240, // ch2 — Perimeter 3
+    0,   // ch3 — Centre (omnidirectional)
 }
 
 // candidateAngles are the steering directions tested for direction estimation.
 // One per perimeter mic, matching the mic positions exactly.
-var candidateAngles = [nDirections]float64{330, 30, 90, 150, 210, 270}
+var candidateAngles = [3]float64{0, 120, 240}
 
 // directionToChannel maps candidateAngles index → ALSA channel number for
 // the perimeter mic at that direction.
 //
-//	candidateAngles[0]=330° → ch0 (MK1)
-//	candidateAngles[1]=30°  → ch1 (MK2)
-//	candidateAngles[2]=90°  → ch2 (MK3)
-//	candidateAngles[3]=150° → ch3 (MK4)
-//	candidateAngles[4]=210° → ch4 (MK5)
-//	candidateAngles[5]=270° → ch5 (MK6)
-var directionToChannel = [nDirections]int{0, 1, 2, 3, 4, 5}
+//  candidateAngles[0]=0°   → ch0
+//  candidateAngles[1]=120° → ch1
+//  candidateAngles[2]=240° → ch2
+var directionToChannel = [3]int{0, 1, 2}
 
 // Beamformer holds direction estimation state and locked mic selection.
 type Beamformer struct {
@@ -390,16 +376,13 @@ func (b *Beamformer) Process(raw []byte, steerAngle float64, gain float64) (mono
 }
 
 // hfEnergy returns the mean squared HF energy for direction di.
-// hfChannels is indexed 0–5 by direction (matching decodeChannels output),
-// not by ALSA channel number — directionToChannel maps direction→channel
-// for audio extraction, but hfChannels uses direction as the index directly.
-func hfEnergy(hfChannels [6][]float32, di int) float64 {
-	n := len(hfChannels[0])
-	var energy float64
-	for _, v := range hfChannels[di] {
-		energy += float64(v) * float64(v)
-	}
-	return energy / float64(n)
+func hfEnergy(hfChannels [nDirections][]float32, di int) float64 {
+    n := len(hfChannels[0])
+    var energy float64
+    for _, v := range hfChannels[di] {
+        energy += float64(v) * float64(v)
+    }
+    return energy / float64(n)
 }
 
 // bandDiff computes the stride-2 difference of each decoded channel into
@@ -416,89 +399,55 @@ func (b *Beamformer) bandDiff() {
 	}
 }
 
-// decodeChannels decodes all 6 perimeter channels from a raw S24_3LE period
+// decodeChannels decodes all perimeter channels from a raw S32_LE period
 // into chanBuf as float32 normalised to [-1, 1]. Reuses chanBuf across
 // periods (§3.5) — every element is overwritten, no clearing needed.
 func (b *Beamformer) decodeChannels(raw []byte) {
-	for i := 0; i < periodFrames; i++ {
-		base := i * frameSize
-		for ci := 0; ci < nDirections; ci++ {
-			offset := base + ci*byteSample
-			b.chanBuf[ci][i] = decodeS24Sample(raw[offset], raw[offset+1], raw[offset+2])
-		}
-	}
+    for i := 0; i < periodFrames; i++ {
+        base := i * frameSize
+        for ci := 0; ci < nDirections; ci++ {
+            offset := base + ci*byteSample
+            b.chanBuf[ci][i] = decodeS32Sample(raw[offset], raw[offset+1], raw[offset+2], raw[offset+3])
+        }
+    }
 }
 
-// decodeS24Sample decodes 3 bytes of S24_3LE to float32 in [-1, 1].
-func decodeS24Sample(b0, b1, b2 byte) float32 {
-	val := int32(b0) | int32(b1)<<8 | int32(b2)<<16
-	if val&0x800000 != 0 {
-		val |= ^int32(0xFFFFFF)
-	}
-	return float32(val) / 8388608.0
+// decodeS32Sample decodes 4 bytes of S32_LE to float32 in [-1, 1].
+func decodeS32Sample(b0, b1, b2, b3 byte) float32 {
+    val := int32(b0) | int32(b1)<<8 | int32(b2)<<16 | int32(b3)<<24
+    return float32(val) / 2147483648.0 // 2^31
 }
 
 // extractChannel extracts a single channel as S16_LE mono, applying the
-// fixed mic gain to the full 24-bit sample before quantising to 16-bit.
+// fixed mic gain to the full 32-bit sample before quantising to 16-bit.
 //
-// This used to take the upper 2 bytes of each 3-byte S24_3LE sample,
-// discarding the low 8 bits — where nearly all of the signal lives at this
-// hardware's capture levels (measured speech RMS 0.0001–0.0006 FS, i.e.
-// ~3–20 LSB in 16-bit terms; 20h fleet logs, 2026-07-07). Applying gain
-// here, against the 24-bit data, recovers real captured resolution;
-// applying it any later would only amplify 16-bit quantisation noise.
-//
-// gain is linear (1.0 = unity). Q12 fixed point: the >>20 combines the
-// Q12 descale with the 24→16 bit reduction (>>8), so gain 1.0 reproduces
-// the old upper-2-bytes behaviour bit-exactly. Samples outside int16
-// range are clamped and counted in clippedSamples.
+// gain is linear (1.0 = unity). Q12 fixed point: the >>28 combines the
+// Q12 descale with the 32→16 bit reduction (>>16), so gain 1.0 reproduces
+// the raw truncation bit-exactly. Samples outside int16 range are clamped 
+// and counted in clippedSamples.
 func (b *Beamformer) extractChannel(raw []byte, ch int, gain float64) []byte {
-	n := len(raw) / frameSize
-	out := make([]byte, n*2)
-	offset0 := ch * byteSample
-	gainQ := int64(gain*4096.0 + 0.5)
-	for i := 0; i < n; i++ {
-		base := i*frameSize + offset0
-		val := int32(raw[base]) | int32(raw[base+1])<<8 | int32(raw[base+2])<<16
-		if val&0x800000 != 0 {
-			val |= ^int32(0xFFFFFF)
-		}
-		v := (int64(val) * gainQ) >> 20
-		if v > 32767 {
-			v = 32767
-			b.clippedSamples++
-		} else if v < -32768 {
-			v = -32768
-			b.clippedSamples++
-		}
-		out[i*2] = byte(uint16(v))
-		out[i*2+1] = byte(uint16(v) >> 8)
-	}
-	return out
+    n := len(raw) / frameSize
+    out := make([]byte, n*2)
+    offset0 := ch * byteSample
+    gainQ := int64(gain*4096.0 + 0.5)
+    for i := 0; i < n; i++ {
+        base := i*frameSize + offset0
+        val := int32(raw[base]) | int32(raw[base+1])<<8 | int32(raw[base+2])<<16 | int32(raw[base+3])<<24
+        
+        v := (int64(val) * gainQ) >> 28
+        if v > 32767 {
+            v = 32767
+            b.clippedSamples++
+        } else if v < -32768 {
+            v = -32768
+            b.clippedSamples++
+        }
+        out[i*2] = byte(uint16(v))
+        out[i*2+1] = byte(uint16(v) >> 8)
+    }
+    return out
 }
 
-// EchoRef extracts the hardware echo reference (ch8) from the same raw
-// period the mic channels come from, as 16kHz mono S16 — the AEC's far-end
-// input, sample-aligned with the near-end by construction because both
-// arrive in one TDM frame off one ADC clock.
-//
-// UNITY GAIN, deliberately and not negotiably. Every mic extraction applies
-// micGainDb (+24dB by default) pre-truncation to recover resolution from
-// speech sitting at ~-70dBFS. The reference is not speech at -70dBFS: it is
-// the playback stream at full digital scale, measured at -7.3dBFS, and
-// +24dB on that is 17dB of hard clipping. A clipped reference does not
-// merely cancel badly, it teaches the adaptive filter a distorted echo
-// path.
-//
-// Returns nil when the buffer is short, which callers read as "no hardware
-// reference this period" and fall back rather than cancelling against
-// silence.
-func (b *Beamformer) EchoRef(raw []byte) []byte {
-	if len(raw) < frameSize {
-		return nil
-	}
-	return b.extractChannel(raw, echoRefCh, 1.0)
-}
 
 // ClippedSamples returns the running count of samples clamped by the mic
 // gain. Read from the mic goroutine only (see field comment).

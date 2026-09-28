@@ -3,14 +3,16 @@ package buttons
 import (
 	"context"
 	"errors"
-	"time"
-	"github.com/wilbowes/EchoMuse/pkg/buttons"
-	evdev "github.com/gvalkov/golang-evdev"
 	"os/exec"
+	"time"
+
+	evdev "github.com/gvalkov/golang-evdev"
+	"github.com/wilbowes/EchoMuse/pkg/buttons"
 )
 
-const dotButton = "/dev/input/event1"
-const volumeButton = "/dev/input/event2"
+// Echo Dot 3 groups Action and Volume on event3, and Mute on event1
+const keysDevicePath = "/dev/input/event3"
+const privacyDevicePath = "/dev/input/event1"
 
 // VolumeCallback is called on volume button release with direction "up" or "down".
 type VolumeCallback func(direction string)
@@ -38,7 +40,8 @@ func (e *EvDevController) SetMuteCallback(cb func()) {
 // Init the button listeners
 // Kills alexa's native button functions
 func (e *EvDevController) Init() error {
-	cmd := exec.Command("stop", "acebutton")
+	// Echo Dot 3 uses acebuttond
+	cmd := exec.Command("stop", "acebuttond")
 	return cmd.Run()
 }
 
@@ -47,13 +50,11 @@ func (e *EvDevController) SubscribeToButton(callback buttons.ButtonClickCallback
 		return nil, errors.New("callback can't be nil")
 	}
 
-	dotBtn := e.GetDotButton()
-	volBtn := e.GetVolumeButton()
-	dotDevice, err := evdev.Open(dotButton)
+	keysDevice, err := evdev.Open(keysDevicePath)
 	if err != nil {
 		return nil, err
 	}
-	volDevice, err := evdev.Open(volumeButton)
+	privacyDevice, err := evdev.Open(privacyDevicePath)
 	if err != nil {
 		return nil, err
 	}
@@ -66,10 +67,6 @@ func (e *EvDevController) SubscribeToButton(callback buttons.ButtonClickCallback
 
 		beforeClickType := buttons.ClickType(0)
 		beforeDown := false
-		// When each click type was pressed, so a release can report how long
-		// it was held. Keyed by click type because the dot device carries the
-		// mute button too, and interleaving the two must not attribute one
-		// button's hold to the other.
 		downAt := map[buttons.ClickType]time.Time{}
 
 		for {
@@ -82,17 +79,6 @@ func (e *EvDevController) SubscribeToButton(callback buttons.ButtonClickCallback
 				return
 			}
 
-			// Only key events. Every key press is followed immediately by
-			// an EV_SYN separator whose Code and Value are both 0 — and
-			// without this filter that SYN fell through to the Code==0
-			// branch, took the previous click type, computed Value==1 as
-			// FALSE, and fired a "release" microseconds after the press.
-			//
-			// So the button has always acted on the SYN rather than on the
-			// real release, which is why it felt instant and why the actual
-			// release (a genuine transition to 0) was then swallowed as a
-			// no-change. Invisible until something needed to know how long
-			// the button was held: heldMs came out at ~0 every time.
 			if inputEvent.Type != evdev.EV_KEY {
 				continue
 			}
@@ -110,27 +96,25 @@ func (e *EvDevController) SubscribeToButton(callback buttons.ButtonClickCallback
 			}
 			beforeDown = down
 
-			// Intercept volume events on volume device
-			if btn.Type == buttons.VolumeButton && !down {
+			// Intercept volume and mute events based directly on clickType
+			if !down {
 				switch clickType {
 				case buttons.VolumeUpClick:
 					if e.volumeCallback != nil {
 						e.volumeCallback("up")
 					}
+					continue
 				case buttons.VolumeDownClick:
 					if e.volumeCallback != nil {
 						e.volumeCallback("down")
 					}
+					continue
+				case buttons.MuteClick:
+					if e.muteCallback != nil {
+						e.muteCallback()
+					}
+					continue
 				}
-				continue
-			}
-
-			// Intercept mute on dot device
-			if btn.Type == buttons.DotButton && !down && clickType == buttons.MuteClick {
-				if e.muteCallback != nil {
-					e.muteCallback()
-				}
-				continue
 			}
 
 			var heldMs int64
@@ -150,8 +134,10 @@ func (e *EvDevController) SubscribeToButton(callback buttons.ButtonClickCallback
 		}
 	}
 
-	go readBtn(dotBtn, dotDevice)
-	go readBtn(volBtn, volDevice)
+	go readBtn(e.GetDotButton(), keysDevice)
+	// Since Mute and Volume interception now rely on clickType, the Button metadata 
+	// passed here only affects un-intercepted events (which event1 has none of).
+	go readBtn(e.GetVolumeButton(), privacyDevice)
 
 	return eventSub, nil
 }
