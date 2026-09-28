@@ -217,10 +217,16 @@ func (p *PcmSpeaker) Init() error {
 		mixer.Set("Headset_PGAR_GAIN", "-2dB")
 		mixer.Set("LINEOUT Mux", "VOICE_AMP")
 		waitForCaptureClocks()
-		// The period the first working Dot 3 firmware opened DL1 with, and
-		// every manual test on that board (tinyplay -p 768 -n 2).
-		cfg.PeriodSize, cfg.PeriodCount = 768, 2
-		cfg.StartThreshold, cfg.StopThreshold, cfg.SilenceThreshold = 768, 1536, 1536
+		// Stock's DL1 period (768 frames, read off a stock Dot 3 playing),
+		// but FOUR of them, not stock's two. Stock's mixer writes 768-frame
+		// periods; this loop writes 1024-frame halves (alsaPeriodSize). Into
+		// stock's 1536-frame buffer a 1024 write only fits once the buffer
+		// has drained to 512 frames, so the loop had ~11ms of slack against
+		// the 19ms lateness measured on biscuit — and tinyalsa recovers the
+		// resulting underruns silently, which is heard as crackle (reported
+		// 2026-09-28). 4 x 768 = 3072 frames (64ms) matches biscuit's margin.
+		cfg.PeriodSize, cfg.PeriodCount = 768, 4
+		cfg.StartThreshold, cfg.StopThreshold, cfg.SilenceThreshold = 768, 3072, 3072
 	}
 
 	device := tinyalsa.NewDevice(cardNr, dev, cfg)
