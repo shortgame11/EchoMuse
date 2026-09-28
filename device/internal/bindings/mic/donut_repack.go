@@ -4,12 +4,21 @@ package mic
 //
 // Everything downstream of the mic — the beamformer, the AEC's hardware
 // reference, the wake word, the data plane — was written against biscuit's
-// capture: 9 channels of S24_3LE, 512 frames a batch, the perimeter mics on
-// ch0-5, the centre mic on ch6 and the playback loopback on ch7/ch8. The Dot 3
-// captures 4 channels of S32_LE (two tlv320aic3101 ADCs on TDM_Capture) and
-// its driver was run at 256-frame periods. Rather than teach every consumer a
-// second layout, the capture is rewritten into the first one here, so the rest
-// of the pipeline is the same code on both boards.
+// capture: 9 channels of S24_3LE, the perimeter mics on ch0-5, the centre mic
+// on ch6 and the playback loopback on ch7/ch8. The Dot 3 captures 4 channels
+// of S32_LE (two tlv320aic3101 ADCs on TDM_Capture). Rather than teach every
+// consumer a second layout, the capture is rewritten into the first one here,
+// so the rest of the pipeline is the same code on both boards.
+//
+// FRAME FOR FRAME, one output batch per read. GoTinyAlsa reads the WHOLE ALSA
+// buffer per call (FrameBytesSize is pcm_get_buffer_size), so biscuit's
+// batches are 5 x 512 = 2560 frames, 160ms — readLoop's ledger comment is
+// about exactly those 160ms steps — and everything downstream is paced by
+// that. The first version of this re-batched each read into five 512-frame
+// batches handed over back to back: readLoop then logged a "capture stall"
+// six times a second (a 32ms batch 160ms after the last one) and the AEC
+// resynced its reference on every burst. Measured on the Dot 3 2026-09-28:
+// stalls=1636 and resyncs=1160 inside an hour, with no audio actually lost.
 //
 // Precision: the S32 samples are 24-bit data left-justified, so keeping the
 // top three bytes loses nothing — the same 24 bits biscuit delivers, and the
@@ -33,8 +42,6 @@ const (
 	outChannels   = 9
 	outSampleSize = 3 // S24_3LE
 	outFrameBytes = outChannels * outSampleSize
-	outFrames     = 512 // biscuit's period, which the beamformer indexes by
-	outBatchBytes = outFrames * outFrameBytes
 )
 
 // donutSlot maps each of biscuit's 9 channels to the Dot 3 channel that fills
@@ -50,46 +57,55 @@ var donutSlot = [outChannels]int{
 	-1, -1, // ch7/ch8: no loopback in this capture
 }
 
-// repacker turns Dot 3 capture periods into biscuit-shaped batches.
-//
-// Input arrives in whatever period the driver runs; output is always exactly
-// outFrames frames, emitted as each batch fills. Owned by the read loop alone.
+// repacker turns each Dot 3 read into one biscuit-shaped batch of the same
+// number of frames. Owned by the read loop alone.
 type repacker struct {
-	batch []byte // the batch being filled; a fresh slice every batch
-	n     int    // frames written into batch
-	tail  []byte // a partial input frame carried to the next push
+	tail []byte // a partial input frame carried to the next push
 }
 
-// push converts in and calls emit once per completed batch. Each emitted slice
-// is newly allocated and never touched again, because subscribers keep it
-// (the mic fans the same slice out to several of them, see readLoop).
+// push converts every whole frame in in (after any carried partial frame) and
+// calls emit ONCE with the result, or not at all if no frame completed. The
+// emitted slice is newly allocated and never touched again, because
+// subscribers keep it (the mic fans the same slice out to several of them,
+// see readLoop). A read is always whole frames in practice; the tail exists so
+// a short read can never shift every later sample into the wrong channel.
 func (r *repacker) push(in []byte, emit func([]byte)) {
+	var head []byte
 	if len(r.tail) > 0 {
 		need := donutFrameBytes - len(r.tail)
 		if len(in) < need {
 			r.tail = append(r.tail, in...)
 			return
 		}
-		frame := append(r.tail, in[:need]...)
-		r.tail = r.tail[:0]
+		head = append(r.tail, in[:need]...)
+		r.tail = nil
 		in = in[need:]
-		r.frame(frame, emit)
 	}
-	for len(in) >= donutFrameBytes {
-		r.frame(in[:donutFrameBytes], emit)
-		in = in[donutFrameBytes:]
+	whole := len(in) / donutFrameBytes
+	n := whole
+	if head != nil {
+		n++
 	}
-	if len(in) > 0 {
-		r.tail = append(r.tail[:0], in...)
+	if rest := in[whole*donutFrameBytes:]; len(rest) > 0 {
+		r.tail = append([]byte(nil), rest...)
 	}
+	if n == 0 {
+		return
+	}
+	out := make([]byte, n*outFrameBytes)
+	o := 0
+	if head != nil {
+		frame(out[:outFrameBytes], head)
+		o = outFrameBytes
+	}
+	for f := 0; f < whole; f++ {
+		frame(out[o+f*outFrameBytes:o+(f+1)*outFrameBytes], in[f*donutFrameBytes:(f+1)*donutFrameBytes])
+	}
+	emit(out)
 }
 
-// frame writes one input frame into the current batch.
-func (r *repacker) frame(src []byte, emit func([]byte)) {
-	if r.batch == nil {
-		r.batch = make([]byte, outBatchBytes)
-	}
-	dst := r.batch[r.n*outFrameBytes : (r.n+1)*outFrameBytes]
+// frame converts one Dot 3 frame into one biscuit frame.
+func frame(dst, src []byte) {
 	for slot, ch := range donutSlot {
 		o := slot * outSampleSize
 		if ch < 0 {
@@ -98,10 +114,5 @@ func (r *repacker) frame(src []byte, emit func([]byte)) {
 		}
 		i := ch*donutSampleSize + 1 // drop the low byte: S32 → S24
 		dst[o], dst[o+1], dst[o+2] = src[i], src[i+1], src[i+2]
-	}
-	r.n++
-	if r.n == outFrames {
-		emit(r.batch)
-		r.batch, r.n = nil, 0
 	}
 }

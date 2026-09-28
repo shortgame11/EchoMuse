@@ -159,8 +159,9 @@ func (p *PcmMicrophone) readLoop() {
 		subDrops     uint64
 	)
 
-	// On the Dot 3 each driver period goes through the repacker, and deliver
-	// runs once per completed biscuit-shaped batch; elsewhere once per period.
+	// On the Dot 3 each read goes through the repacker first, which hands
+	// deliver one biscuit-shaped batch per read, same frame count; elsewhere
+	// deliver sees the read as-is.
 	var rp repacker
 	deliver := func(audio []byte) {
 		now := time.Now()

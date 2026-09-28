@@ -1239,8 +1239,12 @@ starved of valid clocks**, three different ways:
 **The capture is reshaped to biscuit's, so everything downstream is shared**
 (`mic/donut_repack.go`). The Dot 3 captures 4 ch S32_LE from TDM_Capture
 (device 1) at 256-frame periods; the beamformer, the AEC's hardware-reference
-check, the wake word and the data plane all read biscuit's 9 ch S24_3LE in
-512-frame batches. The repacker keeps the top 24 bits (the data is 24-bit,
+check, the wake word and the data plane all read biscuit's 9 ch S24_3LE. It
+converts FRAME FOR FRAME, one batch per read: GoTinyAlsa reads the whole
+buffer per call (2560 frames, 160ms, on both boards), and re-batching a read
+into five 512-frame batches sent back to back made readLoop log a false
+"capture stall" six times a second and the AEC resync on every burst
+(stalls=1636, resyncs=1160 in under an hour, 2026-09-28). The repacker keeps the top 24 bits (the data is 24-bit,
 left-justified), fills biscuit's six perimeter directions from the NEAREST
 real mic so no fixed beam angle lands on a dead channel, puts the Dot 3's ch3
 on the centre channel that feeds the wake word, and leaves ch7/ch8 silent. A
@@ -1249,7 +1253,9 @@ on the software tap without being told. **The mic geometry is unmeasured**:
 ch3-as-centre and ch0-2 at 0/120/240° are what the first working firmware
 assumed. Measure it before trusting the direction overlay or beam locks.
 
-Smaller, in `pcm_speaker.go`, Dot 3 only: device 6 at stock's 768 x 2 period;
+Smaller, in `pcm_speaker.go`, Dot 3 only: device 6 at stock's 768-frame period
+but four of them, not stock's two (this loop writes 1024-frame halves, which
+left ~11ms of slack in stock's 1536-frame buffer);
 stock's routing (`Audio Amp Playback Volume` 0, `Headset_PGAL/R_GAIN` −2 dB,
 `LINEOUT Mux` `VOICE_AMP`) set **before** opening the stream; open only once
 `pcm1c` and `pcm7c` are `RUNNING`, which matches stock's order (it did not by
