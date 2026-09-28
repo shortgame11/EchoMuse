@@ -517,6 +517,9 @@ func (p *PcmSpeaker) silenceLoop() {
 		if p.levelTap != nil {
 			p.levelTap(level)
 		}
+		if outTap != nil {
+			outTap(out)
+		}
 		meter.beforeWrite()
 		if err := p.pump(out); err != nil {
 			log.Printf("silenceLoop: pump error: %v", err)
@@ -525,6 +528,12 @@ func (p *PcmSpeaker) silenceLoop() {
 		meter.afterWrite()
 	}
 }
+
+// outTap receives every period exactly as it is handed to ALSA, and is nil in
+// release builds. Only outtap_bench.go sets it (build tag bench): recorded
+// beside the Dot 3's DL1 loopback (mic/awbtap_bench.go), it separates audio
+// that was already wrong from audio that went wrong on its way out.
+var outTap func([]byte)
 
 // pump writes one mixed period to ALSA in hardware-period pieces, so the
 // buffer is topped up a hardware period at a time rather than waiting for
