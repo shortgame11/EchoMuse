@@ -1,0 +1,1299 @@
+diff --git a/controller/static/dashboard.jsx b/controller/static/dashboard.jsx
+index e95dc48..ea334cb 100644
+--- a/controller/static/dashboard.jsx
++++ b/controller/static/dashboard.jsx
+@@ -2943,6 +2943,7 @@ const _EMOS_CONNECT_STEPS = new Set([0, 1]);
+ // drift when either flow gains a step.
+ const INPUT_STEPS = new Set([
+   'install_magisk', 'wifi', 'install_em', 'build_emos', 'wifi_register',
++  'patch_system',
+ ]);
+ 
+ // Which mode each step has to run in.
+@@ -2983,12 +2984,38 @@ const _EMOS_STEP_MODE = {
+ // Steps driven over the serial console rather than ADB.
+ const _EMOS_SERIAL_STEPS = new Set([7, 8]);
+ 
++// Echo Dot 3rd gen (donut_puffin, MT8167, FireOS 6 / Android 7.1). See
++// _DONUT_STEPS for why it is its own flow. Connect, TWRP, and the reconnect
++// after the one reboot are the connection steps.
++const _DONUT_CONNECT_STEPS = new Set([0, 1, 6]);
++
++// Everything that writes happens in TWRP (steps 1-4): /system is read-only
++// on a live boot and the Dot 3 has no Magisk to remount it. Android is only
++// visited at the end, to confirm the edits took and to join WiFi.
++const _DONUT_STEP_MODE = {
++  0: 'android',
++  1: 'twrp', 2: 'twrp', 3: 'twrp', 4: 'twrp', 5: 'twrp',
++  6: 'android', 7: 'android', 8: 'android',
++};
++
++// Which board a device is, from its product model/name. 'donut' is the Echo
++// Dot 3rd gen (ro.product.name donut_puffin, TWRP omni_donut); everything else
++// is left to the biscuit checks that were here before it.
++function _boardOf(model, name) {
++  const m = (model || '').toLowerCase(), n = (name || '').toLowerCase();
++  if (n.includes('donut') || n.includes('puffin') || m.includes('donut')) return 'donut';
++  return 'biscuit';
++}
++
+ // TWRP is checked first: its banner is "omni_biscuit", which also contains
+ // "biscuit", so an Android-first test would call every TWRP device Android.
+ function _bannerMode(banner) {
+   const b = (banner || '').toLowerCase();
+   if (b.includes('omni') || b.includes('twrp') || b.includes('recovery')) return 'twrp';
+   if (b.includes('csm') || b.includes('biscuit')) return 'android';
++  // Echo Dot 3rd gen under FireOS 6 ("donut_puffin"). After the TWRP test for
++  // the same reason as biscuit: its recovery reports "omni_donut".
++  if (b.includes('donut') || b.includes('puffin')) return 'android';
+   return 'unknown';
+ }
+ 
+@@ -3441,6 +3468,337 @@ const _EMOS_STEPS = [
+   { id: 'wifi_register',   label: 'Configure WiFi',    desc: 'Scan and join a network using the device’s own radio, then wait for it to register with the controller.' },
+ ];
+ 
++// The Echo Dot 3rd gen flow. Nine steps, and what is NOT here matters as much
++// as what is:
++//
++//   Patch Boot Image   The Dot 3 is system-as-root with its init files on the
++//                      system partition, and the boot ramdisk the FireOS flow
++//                      patches is not the one that holds them (it edits the
++//                      recovery ramdisk's init on this layout, so nothing it
++//                      writes is ever read). The permissive cmdline has no
++//                      effect either: SELinux stays Enforcing. Both jobs move
++//                      to Patch System below, which edits the files init
++//                      actually reads and patches the policy itself.
++//   Install Magisk     Root in Android comes from boot-root.zip (the same zip
++//   Pre-seed Root DB   used when the device was unlocked), which makes adbd
++//   Verify Root        root. There is no Magisk and no `su`, so there is
++//                      nothing to seed and nothing to verify beyond `id`.
++//   Disable Alexa      Done persistently in Patch System, by commenting out
++//   Debloat            the init triggers that start the Amazon stack. There is
++//                      no package manager on this build (no app_process), so
++//                      the pm-based steps cannot run at all.
++//
++// Everything that writes is done in TWRP, in one visit, because /system is
++// read-only on a live boot. Android is visited once at the end: to confirm the
++// edits held across a real boot, and to join WiFi with the device's own radio.
++//
++// The speaker needs EchoMuse built with the Dot 3 audio changes (TAS2770 amp,
++// shared I2S clock) — the system edits here do not touch audio. A release
++// without them installs and connects, but plays nothing.
++const _DONUT_STEPS = [
++  { id: 'connect_android', label: 'Connect Device',    desc: 'Connect the Echo Dot 3rd gen via USB, booted into FireOS or already in TWRP. It must already be unlocked (amonet) with TWRP and boot-root installed.' },
++  { id: 'connect_twrp',    label: 'Connect to TWRP',   desc: 'Wait for TWRP recovery to appear, then reconnect. Everything that writes happens there.' },
++  { id: 'patch_system',    label: 'Patch System',      desc: 'Disable the Alexa start triggers, start WiFi + DHCP at boot, add the EchoMuse init service, install busybox, and allow the service in the SELinux policy. Every edited file is backed up to /em-backup.' },
++  { id: 'install_em',      label: 'Install EchoMuse',  desc: 'Push the server binary, startup script and TLS credentials to /data.' },
++  { id: 'install_oww',     label: 'Wake Word Assets',  desc: 'Push the ONNX runtime and wake models (~15MB) used for on-device wake word detection.' },
++  { id: 'reboot',          label: 'Reboot to FireOS',  desc: 'Reboot out of TWRP into FireOS.' },
++  { id: 'reconnect',       label: 'Reconnect',         desc: 'Re-connect ADB as soon as the device appears in the USB picker — the next step waits for boot to finish.' },
++  { id: 'verify',          label: 'Verify',            desc: 'Confirm root, that the Alexa services stayed down, and that init started EchoMuse.' },
++  { id: 'wifi',            label: 'Configure WiFi',    desc: 'Scan and join a network with the device’s own wpa_supplicant. It reconnects by itself on every boot from now on.' },
++];
++
++// One named entry out of a zip, in the browser. boot-root.zip and
++// emos-payload.zip each carry a single binary this flow needs, and asking for
++// the zip the operator already has beats asking them to unpack it. Stored and
++// deflated entries only — the two a zip tool produces — with deflate done by
++// the browser's own DecompressionStream, which every WebUSB browser has.
++// Returns null when `buf` is not a zip or holds no such entry.
++async function _zipEntry(buf, want) {
++  const b = new Uint8Array(buf);
++  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
++  let eocd = -1;
++  for (let i = b.length - 22; i >= Math.max(0, b.length - 65557); i--) {
++    if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
++  }
++  if (eocd < 0) return null;
++  const count = dv.getUint16(eocd + 10, true);
++  let p = dv.getUint32(eocd + 16, true);
++  const dec = new TextDecoder();
++  for (let k = 0; k < count && p + 46 <= b.length; k++) {
++    if (dv.getUint32(p, true) !== 0x02014b50) return null;
++    const method = dv.getUint16(p + 10, true);
++    const csize  = dv.getUint32(p + 20, true);
++    const nlen   = dv.getUint16(p + 28, true);
++    const xlen   = dv.getUint16(p + 30, true);
++    const clen   = dv.getUint16(p + 32, true);
++    const loff   = dv.getUint32(p + 42, true);
++    const name   = dec.decode(b.subarray(p + 46, p + 46 + nlen));
++    p += 46 + nlen + xlen + clen;
++    if (name !== want && !name.endsWith('/' + want)) continue;
++    if (dv.getUint32(loff, true) !== 0x04034b50) return null;
++    const start = loff + 30 + dv.getUint16(loff + 26, true) + dv.getUint16(loff + 28, true);
++    const data = b.subarray(start, start + csize);
++    if (method === 0) return data.slice();
++    if (method !== 8) return null;
++    const out = new Response(new Blob([data]).stream()
++      .pipeThrough(new DecompressionStream('deflate-raw')));
++    return new Uint8Array(await out.arrayBuffer());
++  }
++  return null;
++}
++
++// An executable this 32-bit ARM userspace can run: ELF, 32-bit class,
++// e_machine 40 (ARM). The Dot 3's FireOS 6 kernel is 32-bit, so an aarch64
++// busybox — or a zip picked where a binary was meant — is refused here rather
++// than failing on the device as "not found".
++function _isElfArm32(bytes) {
++  return !!bytes && bytes.length > 20
++      && bytes[0] === 0x7f && bytes[1] === 0x45 && bytes[2] === 0x4c && bytes[3] === 0x46
++      && bytes[4] === 1 && (bytes[18] | (bytes[19] << 8)) === 40;
++}
++
++// What Patch System runs in TWRP. It is echomuse-donut-setup.sh made
++// idempotent and slot-aware, and it is written out whole rather than as a
++// chain of shell calls so that the thing that edits the system partition can
++// be read in one place.
++//
++// Inputs, pushed by runDonutPatchSystem: /tmp/em/busybox (optional once
++// /system/xbin/busybox exists) and /tmp/em-magiskpolicy (optional once the
++// policy carries the patch marker). A missing required input is reported as
++// NEED_BUSYBOX / NEED_MAGISKPOLICY BEFORE anything is written.
++//
++// Lessons baked in, each measured on G090U50984612RLM (2026-09):
++//  - This Android 7 init loads EVERY file in /system/etc/init whatever its
++//    extension, so backups and parked copies go to /em-backup, never beside
++//    the original.
++//  - init does not honour a script's shebang, and will not start a service
++//    from /data without a seclabel; su is the domain boot-root's policy has.
++//  - / is read-only at runtime and start_server.sh logs to /tmp, so /tmp is a
++//    tmpfs mounted on a directory created here.
++//  - The controller's file transfers decode with busybox or python; FireOS 6
++//    has neither, so busybox goes to /system/xbin.
++//  - magiskpolicy is dynamically linked against the device's own bionic, so
++//    the real /system is bind-mounted over TWRP's while it runs.
++const _DONUT_SETUP_SCRIPT = String.raw`
++MNT=/mnt/em_sys
++say()  { echo "[*] $*"; }
++warn() { echo "[!] $*"; }
++die()  { echo "[X] $*"; echo _DONUT_FAIL; exit 1; }
++
++SLOT=$(getprop ro.boot.slot_suffix 2>/dev/null)
++SYS_DEV=""
++for d in /dev/block/platform/*/by-name /dev/block/by-name; do
++  for n in "system$SLOT" system_a system; do
++    if [ -z "$SYS_DEV" ] && [ -e "$d/$n" ]; then SYS_DEV=$(readlink -f "$d/$n"); fi
++  done
++done
++[ -n "$SYS_DEV" ] || die "no system partition found by name"
++say "system partition: $SYS_DEV"
++
++mkdir -p "$MNT"
++if ! grep -q " $MNT " /proc/mounts; then
++  if ! mount -o rw "$SYS_DEV" "$MNT" 2>/dev/null; then
++    # Mounted read-only elsewhere by TWRP: a second rw mount of the same
++    # superblock is refused, so release it and try again.
++    for m in $(grep "^$SYS_DEV " /proc/mounts | cut -d' ' -f2); do umount "$m" 2>/dev/null; done
++    mount -o rw "$SYS_DEV" "$MNT" || die "could not mount $SYS_DEV read-write"
++  fi
++fi
++INIT_DIR="$MNT/system/etc/init"
++grep -q "donut" "$MNT/system/build.prop" 2>/dev/null \
++  || { umount "$MNT"; die "$SYS_DEV is not an Echo Dot 3rd gen system (no donut in build.prop) — nothing written"; }
++touch "$INIT_DIR/.em_w" 2>/dev/null && rm -f "$INIT_DIR/.em_w" || die "$INIT_DIR is not writable"
++
++BACKUP_DIR="$MNT/em-backup"
++mkdir -p "$BACKUP_DIR"
++
++# Run "$@" with the device's own /system (its linker and libraries) visible
++# at /system. A binary built for FireOS rather than statically — magiskpolicy
++# always, and many busybox builds — cannot run in TWRP otherwise: its
++# interpreter is /system/bin/linker, which is the recovery's, not FireOS's.
++# Scoped to the one command, because TWRP's own tools may live in /system.
++with_sys() {
++  umount /system 2>/dev/null
++  mount -o bind "$MNT/system" /system || return 97
++  LD_LIBRARY_PATH=/system/lib "$@"; r=$?
++  umount /system 2>/dev/null
++  return $r
++}
++
++# The busybox to install. Accepted if it runs either way: static, or linked
++# against FireOS's libraries (it will run under FireOS either way). Checked
++# here, before anything is written.
++if [ -f /tmp/em/busybox ]; then
++  chmod 755 /tmp/em/busybox
++  if /tmp/em/busybox true >/dev/null 2>&1; then
++    say "busybox to install: static build"
++  elif with_sys /tmp/em/busybox true >/dev/null 2>&1; then
++    say "busybox to install: built against FireOS's libraries"
++  else
++    # Say WHY. "does not run" alone cost a round trip: the reason (exec format
++    # error, not found, permission denied) is the whole diagnosis.
++    warn "  /tmp/em/busybox true -> $(/tmp/em/busybox true 2>&1; echo "exit $?")"
++    warn "  with FireOS libraries -> $(with_sys /tmp/em/busybox true 2>&1; echo "exit $?")"
++    warn "  /tmp is mounted: $(grep ' /tmp ' /proc/mounts | cut -d' ' -f3,4)"
++    warn "  kernel: $(uname -m)"
++    echo BAD_BUSYBOX; die "the chosen busybox does not run on this device — nothing written"
++  fi
++elif [ ! -f "$MNT/system/xbin/busybox" ]; then
++  echo NEED_BUSYBOX; die "no busybox available"
++fi
++
++# awk, for editing the init scripts. TWRP's own first; otherwise a busybox
++# above, run with FireOS's libraries if it needs them.
++AWK=""; AWK_SYS=""
++for a in "busybox awk" "awk" "/tmp/em/busybox awk" "$MNT/system/xbin/busybox awk"; do
++  [ -z "$AWK" ] || break
++  [ "$(echo x | $a '{print}' 2>/dev/null)" = x ] && AWK="$a"
++done
++if [ -z "$AWK" ]; then
++  for a in "/tmp/em/busybox awk" "$MNT/system/xbin/busybox awk"; do
++    [ -z "$AWK" ] || break
++    [ "$(echo x | with_sys $a '{print}' 2>/dev/null)" = x ] && { AWK="$a"; AWK_SYS=1; }
++  done
++fi
++[ -n "$AWK" ] || { echo NEED_BUSYBOX; die "no working awk: neither TWRP nor the chosen busybox provides one"; }
++if [ -n "$AWK_SYS" ]; then say "awk: $AWK (with FireOS's libraries)"; else say "awk: $AWK"; fi
++run_awk() { if [ -n "$AWK_SYS" ]; then with_sys $AWK "$@"; else $AWK "$@"; fi; }
++
++SEPOL="$MNT/sepolicy"
++[ -f "$SEPOL" ] || die "sepolicy not found at $SEPOL"
++if [ ! -f "$BACKUP_DIR/.sepolicy-patched" ] && [ ! -f /tmp/em-magiskpolicy ]; then
++  echo NEED_MAGISKPOLICY; die "the SELinux policy is not patched yet and no magiskpolicy was supplied"
++fi
++
++backup() {
++  [ -f "$1" ] || return 0
++  dest="$BACKUP_DIR/$(echo "$1" | sed "s|^$MNT/||" | tr '/' '_').em-orig"
++  [ -f "$dest" ] || { cp -a "$1" "$dest" && say "  backed up $(basename "$1")"; }
++  return 0
++}
++
++for stale in "$INIT_DIR"/*.em-orig "$INIT_DIR"/*.em-new "$INIT_DIR"/*.off "$INIT_DIR"/*.em-disabled; do
++  [ -f "$stale" ] || continue
++  mv "$stale" "$BACKUP_DIR/" && say "  moved stray $(basename "$stale") out of the init directory"
++done
++
++comment_block() {
++  file="$1"; marker="$2"
++  [ -f "$file" ] || { warn "  $(basename "$file") missing — skipped"; return 0; }
++  if ! grep -q "^on .*$marker" "$file"; then
++    if grep -q "^#on .*$marker" "$file"; then say "  already disabled: $marker"
++    else warn "  trigger not found: $marker in $(basename "$file")"; fi
++    return 0
++  fi
++  backup "$file"
++  run_awk -v m="$marker" '
++    BEGIN { inblock=0 }
++    {
++      if (inblock) {
++        if ($0 ~ /^[ \t]/ || $0 ~ /^[ \t]*$/) { print "#" $0; next }
++        else { inblock=0 }
++      }
++      if ($0 ~ /^on / && index($0, m) > 0) { print "#" $0; inblock=1; next }
++      print
++    }' "$file" > /tmp/em-block.new && cp /tmp/em-block.new "$file" && rm -f /tmp/em-block.new \
++    || die "could not rewrite $(basename "$file")"
++  chmod 644 "$file"
++  say "  disabled: $marker"
++}
++
++say "1/5 Alexa start triggers"
++comment_block "$INIT_DIR/init.smarthomed.rc"  "com.amazon.puffin.PUFFIN_START"
++comment_block "$INIT_DIR/init.commsd.rc"      "audio_mixer.init=true"
++comment_block "$INIT_DIR/init.ama_server.rc"  "kvs_init_completed"
++comment_block "$INIT_DIR/init.oobe.puffin.rc" "com.amazon.puffin.OOBE_SETUP"
++comment_block "$INIT_DIR/init.oobe.puffin.rc" "OOBED_START=on_boot"
++comment_block "$INIT_DIR/init.oobe.puffin.rc" "OOBED_START=on_button_press"
++comment_block "$INIT_DIR/init.oobe.puffin.rc" "OOBED_START=on_network_disconnect"
++comment_block "$MNT/init.mt8516.rc"           "com.amazon.puffin.PUFFIN_START=1 && property:audio_mixer.init=true"
++
++say "2/5 WiFi + DHCP at boot"
++CONN="$MNT/init.connectivity.rc"
++[ -f "$CONN" ] || die "init.connectivity.rc not found"
++if grep -q "dhcpcd_wlan0" "$CONN"; then
++  say "  already present"
++else
++  backup "$CONN"
++  cat >> "$CONN" <<'RC'
++
++# EchoMuse: bring wlan0 up and start wpa_supplicant + dhcp at boot
++service dhcpcd_wlan0 /system/bin/dhcpcd -B wlan0
++    class main
++    user root
++    group root
++
++on property:sys.boot_completed=1
++    ifconfig wlan0 up
++    start wpa_supplicant
++    start dhcpcd_wlan0
++RC
++  chmod 644 "$CONN"
++  say "  added dhcpcd_wlan0 and the boot trigger"
++fi
++
++say "3/5 EchoMuse init service"
++mkdir -p "$MNT/tmp" && chmod 1777 "$MNT/tmp"
++cat > "$INIT_DIR/init.echomuse.rc" <<'RC'
++service echomuse /system/bin/sh /data/local/bin/start_server.sh
++    class main
++    user root
++    group root system
++    seclabel u:r:su:s0
++    oneshot
++
++on property:sys.boot_completed=1
++    mount tmpfs tmpfs /tmp mode=1777
++    start echomuse
++RC
++chmod 644 "$INIT_DIR/init.echomuse.rc"
++say "  wrote init.echomuse.rc"
++
++say "4/5 busybox"
++if [ -f /tmp/em/busybox ]; then
++  # Stock FireOS 6 on the Dot 3 has no /system/xbin, so create it — with the
++  # same owner, mode and label Android gives it — before copying in.
++  if [ ! -d "$MNT/system/xbin" ]; then
++    mkdir -p "$MNT/system/xbin" || die "could not create /system/xbin"
++    chmod 755 "$MNT/system/xbin"
++    chcon u:object_r:system_file:s0 "$MNT/system/xbin" 2>/dev/null
++    say "  created /system/xbin"
++  fi
++  cp /tmp/em/busybox "$MNT/system/xbin/busybox" && chmod 755 "$MNT/system/xbin/busybox" \
++    || die "could not install busybox"
++  chcon u:object_r:system_file:s0 "$MNT/system/xbin/busybox" 2>/dev/null
++  [ "$(wc -c < /tmp/em/busybox)" = "$(wc -c < "$MNT/system/xbin/busybox")" ] \
++    || die "busybox was not copied to /system/xbin intact"
++  say "  installed /system/xbin/busybox ($(wc -c < "$MNT/system/xbin/busybox") bytes)"
++else
++  say "  /system/xbin/busybox already present"
++fi
++
++say "5/5 SELinux policy"
++if [ -f "$BACKUP_DIR/.sepolicy-patched" ]; then
++  say "  already patched"
++else
++  backup "$SEPOL"
++  chmod 755 /tmp/em-magiskpolicy
++  rm -f /tmp/sepolicy.new
++  with_sys /tmp/em-magiskpolicy --load "$SEPOL" --save /tmp/sepolicy.new \
++    'allow init su process { transition rlimitinh siginh noatsecure }' 'permissive su' 2>&1
++  RC=$?
++  [ $RC -eq 97 ] && die "could not bind-mount the device /system for magiskpolicy"
++  [ $RC -eq 0 ] && [ -s /tmp/sepolicy.new ] || die "magiskpolicy failed (exit $RC) — policy left unchanged"
++  cp /tmp/sepolicy.new "$SEPOL" && chmod 644 "$SEPOL" || die "could not write the patched policy"
++  touch "$BACKUP_DIR/.sepolicy-patched"
++  say "  patched: init may start su-domain services; su is permissive"
++fi
++
++sync
++umount "$MNT" 2>/dev/null || warn "could not unmount $MNT (harmless)"
++echo _DONUT_SETUP_OK
++`;
++
+ // ── WifiPanel ──
+ 
+ // `ready` is whatever transport this panel is driving — an ADB handle in the
+@@ -3844,10 +4202,15 @@ function _wizardFlow() {
+   try {
+     const want = new URLSearchParams(window.location.search).get('flow');
+     if (want === 'fireos') return 'fireos';
++    if (want === 'donut' || want === 'dot3') return 'donut';
+   } catch { /* no location in a test harness; take the default */ }
+   return 'emos';
+ }
+ 
++function _flowSteps(flow) {
++  return flow === 'emos' ? _EMOS_STEPS : flow === 'donut' ? _DONUT_STEPS : _WIZARD_STEPS;
++}
++
+ function ProvisionWizard({ token, onClose, knownDevices }) {
+   // State rather than a ref, but frozen the moment anything has run — see
+   // `flowLocked` below. The two flows have different step COUNTS, so switching
+@@ -3858,10 +4221,16 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+   // ticked, never remembered between runs, and locked with the flow once
+   // anything has run.
+   const [wipeData, setWipeData] = useState(false);
+-  const isEmos = flow === 'emos';
+-  const STEPS = isEmos ? _EMOS_STEPS : _WIZARD_STEPS;
+-  const STEP_MODE = isEmos ? _EMOS_STEP_MODE : _STEP_MODE;
+-  const CONNECT = isEmos ? _EMOS_CONNECT_STEPS : CONNECT_STEPS;
++  const isEmos   = flow === 'emos';
++  const isDonut  = flow === 'donut';
++  const isFireos = flow === 'fireos';
++  const STEPS     = _flowSteps(flow);
++  const STEP_MODE = isEmos ? _EMOS_STEP_MODE : isDonut ? _DONUT_STEP_MODE : _STEP_MODE;
++  const CONNECT   = isEmos ? _EMOS_CONNECT_STEPS : isDonut ? _DONUT_CONNECT_STEPS : CONNECT_STEPS;
++  // Index of a step in the CURRENT flow by id, for the UI and the few runners
++  // that name a step. The three flows number their steps differently, so a
++  // hardcoded index is right in one flow and silently wrong in the others.
++  const idxOf = id => STEPS.findIndex(s => s.id === id);
+   const [step, setStep]         = useState(0);
+   const [stepState, setStepState] = useState(STEPS.map(() => 'pending'));
+   const [log, setLog]           = useState([]);
+@@ -3878,6 +4247,15 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+   const adbRef                  = useRef(null);
+   const setAdb = c => { adbRef.current = c; _setAdb(c); };
+   const [magiskFile, setMagiskFile] = useState(null);
++  // Echo Dot 3rd gen: boot-root.zip (for its magiskpolicy32, and flashed only
++  // when Android's adbd was found not to be root) and a busybox binary or the
++  // emos-payload.zip that carries one.
++  const [bootRootFile, setBootRootFile] = useState(null);
++  const [busyboxFile, setBusyboxFile]   = useState(null);
++  // Set at Connect Device when Android answered with a non-root adbd, i.e.
++  // boot-root is not on the boot partition. Unknown (false) when the device
++  // arrived already in TWRP; Verify catches it after the reboot either way.
++  const donutNeedsRootRef = useRef(false);
+   const [binaryFile, setBinaryFile] = useState(null);
+   // emOS flow. `emosRef` is the escrowed boot image — the build input
+   // and the undo — held in the page for the length of the wizard; the copy
+@@ -3960,7 +4338,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+     // rebuilt rather than carried across.
+     setFlow(next);
+     if (next !== 'emos') setWipeData(false);
+-    setStepState((next === 'emos' ? _EMOS_STEPS : _WIZARD_STEPS).map(() => 'pending'));
++    setStepState(_flowSteps(next).map(() => 'pending'));
+     setStep(0);
+     setLog([]);
+   }
+@@ -4060,7 +4438,18 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+ 
+   async function collectProvisionDiagnostics(c, stepIdx, err) {
+     const probes = {};
+-    for (const [name, cmd] of Object.entries(_PROVISION_PROBES)) {
++    // The Dot 3 has no su and no package manager, so the probes above that
++    // use them come back empty there. These ask the same questions directly,
++    // plus the state Patch System is responsible for.
++    const extra = isDonut ? {
++      wpa_status_root: `${wpaCli('status')} 2>&1`,
++      donut_services:  "getprop | grep -E 'init.svc.(echomuse|wpa_supplicant|dhcpcd_wlan0|puffin|oobed|amakit)'",
++      donut_alexa:     "ps | grep -E 'PuffinApp|oobed|amakit_server|SmartHomed|commsd' | grep -v grep",
++      donut_init:      'ls -l /system/etc/init/init.echomuse.rc /system/xbin/busybox 2>&1; grep -c dhcpcd_wlan0 /init.connectivity.rc 2>&1',
++      donut_tmp:       'grep " /tmp " /proc/mounts 2>&1',
++      donut_wlan:      'ifconfig wlan0 2>&1',
++    } : {};
++    for (const [name, cmd] of Object.entries({ ..._PROVISION_PROBES, ...extra })) {
+       try {
+         // Bounded per probe. The device has just failed something and may be
+         // half gone; without this, one unanswered command hangs the whole
+@@ -4275,11 +4664,55 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+     } else {
+       addLog(`Firmware: ${fwName || '(unknown)'}  ${fwBuild || ''}`);
+     }
++    // Echo Dot 3rd gen. Detected here, from the identity just read, rather
++    // than trusted to the flow picker: the Dot 3 must never run the biscuit
++    // steps (Patch Boot Image writes a ramdisk this board does not read, and
++    // the pm-based steps have no package manager to talk to), and a Dot 2 must
++    // never run the Dot 3's system-partition edits.
++    //
++    // Switching flow HERE is safe because steps 0 and 1 are the same step in
++    // every flow — nothing that differs between them has run yet.
++    const board = _boardOf(model, name);
++    if (board === 'donut') {
++      if (!isDonut) {
++        addLog('This is an Echo Dot 3rd gen (donut_puffin) — switching to the Dot 3 '
++             + 'steps. Magisk, the boot image patch and the package-manager steps '
++             + 'do not apply to it.', 'ok');
++        setFlow('donut');
++        setWipeData(false);
++        setStepState(_DONUT_STEPS.map((_, i) => (i === 0 ? 'running' : 'pending')));
++      }
++      if (effRelease && !effRelease.startsWith('7.')) {
++        throw new Error(`Expected FireOS 6 (Android 7.x) on an Echo Dot 3rd gen, got `
++          + `Android ${effRelease}. The Dot 3 steps have only been run on FireOS 6.`);
++      }
++      // Root in Android is boot-root's patched adbd. Only knowable from
++      // Android; in TWRP everything is root regardless.
++      if (!inRecovery) {
++        const uid = (await c.shell('id -u')).trim();
++        donutNeedsRootRef.current = uid !== '0';
++        if (donutNeedsRootRef.current) {
++          addLog(`adb is not root under FireOS (uid ${uid || '?'}), so boot-root is `
++               + 'not installed. Patch System will flash your boot-root.zip.', 'warn');
++        } else {
++          addLog('adb is root under FireOS (boot-root is installed).', 'ok');
++        }
++      }
++    } else if (isDonut) {
++      expectDisconnect.current = true;
++      try { await c.close(); } catch {}
++      setAdb(null);
++      throw new Error(`This is not an Echo Dot 3rd gen (model "${model || 'unknown'}", `
++        + `codename "${name || 'unknown'}"). The Dot 3 steps edit that board's system `
++        + 'partition and must not run on anything else. Pick emOS or FireOS + root '
++        + 'instead — nothing has been written.');
++    }
++
+     // amonet v2.0.0 — see _unlockVerdict. expdb and the TWRP version can only
+     // be read in recovery (expdb needs root); in Android the release is the
+     // evidence, and a v2 device that boots Android is necessarily on FireOS 6.
+     let expdb = '', twrp = '';
+-    if (inRecovery) {
++    if (inRecovery && board !== 'donut') {
+       const u = await c.shell(
+         'P=""; for d in /dev/block/platform/*/by-name /dev/block/by-name; do '
+         + '[ -z "$P" ] && [ -e "$d/expdb" ] && P="$d/expdb"; done; '
+@@ -4308,7 +4741,9 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+     // escrow-build-flash sequence the emOS flow runs is not FireOS-5-specific at
+     // any step: it reads the device's own boot image, rebuilds it with an init
+     // matching that image's kernel, and writes it back.
+-    const unlock = _unlockVerdict({ release: effRelease, expdb, twrp });
++    const unlock = board === 'donut'
++      ? { v2: false, evidence: [] }
++      : _unlockVerdict({ release: effRelease, expdb, twrp });
+     if (unlock.v2 && !isEmos) {
+       expectDisconnect.current = true;
+       try { await c.close(); } catch {}
+@@ -4339,7 +4774,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+     // device, and the point of this check is to catch that before anything is
+     // written.
+     const okRelease = isEmos ? ['5.', '7.'] : ['5.'];
+-    if ((!inRecovery || effRelease)
++    if (board !== 'donut' && (!inRecovery || effRelease)
+         && !okRelease.some(p => effRelease.startsWith(p))) {
+       throw new Error(
+         `Expected ${isEmos ? 'FireOS 5 or 6 (Android 5.x or 7.x)' : 'FireOS 5 (Android 5.x)'}`
+@@ -4354,7 +4789,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+     // the failure lands after the boot partition has been written.
+     const boardOk = (model && model.toLowerCase().includes('amazon'))
+                  || (name && name.toLowerCase().includes('biscuit'));
+-    if (!boardOk) {
++    if (!boardOk && board !== 'donut') {
+       if (isEmos) {
+         expectDisconnect.current = true;
+         try { await c.close(); } catch {}
+@@ -5736,11 +6171,18 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+   // wpa_state log: the network is not on the air at all, it is there but the
+   // radio cannot join it (WPA3), or it is there and joinable, which points at
+   // the password or the AP rather than at us.
++  // wpa_cli as root. FireOS 5 needs su for it; the Dot 3's adbd IS root and
++  // has no su binary at all, so wrapping it there fails with "su: not found".
++  // Both -p and -i are always passed — see scanWifi for why.
++  const wpaCli = args => isDonut
++    ? `wpa_cli -p /data/misc/wifi/sockets -i wlan0 ${args}`
++    : `su -c 'wpa_cli -p /data/misc/wifi/sockets -i wlan0 ${args}'`;
++
+   async function reportWhyNoAssociation(c, ssid) {
+     try {
+-      await c.shell("su -c 'wpa_cli -p /data/misc/wifi/sockets -i wlan0 scan'");
++      await c.shell(wpaCli('scan'));
+       await new Promise(r => setTimeout(r, 3000));
+-      const raw = await c.shell("su -c 'wpa_cli -p /data/misc/wifi/sockets -i wlan0 scan_results'");
++      const raw = await c.shell(wpaCli('scan_results'));
+       const seen = parseScanResults(raw);
+       const match = seen.find(n => n.ssid === ssid);
+ 
+@@ -5764,7 +6206,10 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+     }
+   }
+ 
+-  async function runConfigWifi(c, ssid, psk) {
++  // The checks and facts every WiFi join needs before it touches the device,
++  // shared by the FireOS join below and the Dot 3's native one. Throws with
++  // the reason when the network cannot be joined as given.
++  function planWifi(ssid, psk) {
+     const ssidB = ssidBytesFor(ssid || '');
+     const bad = _ssidProblem(ssidB) || _pskProblem(psk);
+     if (bad) throw new Error(bad);
+@@ -5795,41 +6240,22 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+     } else {
+       addLog(`"${ssid}" was not in the last scan — configuring it as a hidden network.`, 'warn');
+     }
++    return { ssidConf, security, hidden, psk };
++  }
+ 
+-    // Android 5.1's WifiAutoJoinController blocks auto-join after enough
+-    // "no internet" reports. Reset the persisted counter before disabling the
+-    // source of new reports, so an already-provisioned device recovers too.
+-    addLog('Resetting Android WiFi network history…');
+-    await c.shell('su -c "rm -f /data/misc/wifi/networkHistory.txt"');
+-
+-    // On a local-only LAN every connection is flagged, so the counter grows
+-    // every reboot until association is suppressed (#317).
+-    addLog('Disabling captive portal detection (EchoMuse is local-only)…');
+-    await c.shell('su -c "settings put global captive_portal_detection_enabled 0"');
+-    const captivePortal = (await c.shell(
+-      'su -c "settings get global captive_portal_detection_enabled"')).trim();
+-    if (captivePortal !== '0') {
+-      throw new Error(`Captive portal detection setting read back ${captivePortal || '(empty)'}, expected 0.`);
+-    }
+-    addLog('Captive portal detection disabled (read back 0).', 'ok');
+-
+-    addLog('Enabling WiFi radio…');
+-    await c.shell("su -c 'svc wifi enable'");
+-    await new Promise(r => setTimeout(r, 2000));
+-
+-    // Read device identity fields from getprop rather than assuming any
+-    // existing wpa_supplicant.conf — this must work on a bare device that
+-    // never had the Alexa WiFi setup flow run.
++  // Full config replacement — single network only, no ambiguity about which
++  // AP it joins. Deliberately drops any prior (e.g. Alexa-era) network
++  // entries. Identity fields come from getprop rather than any existing
++  // wpa_supplicant.conf, so this works on a device that never ran Amazon's
++  // WiFi setup.
++  async function wpaConfText(c, plan) {
++    const { ssidConf, security, hidden, psk } = plan;
+     addLog('Reading device identity…');
+     const deviceName   = await c.shell('getprop ro.product.name')          || 'echomuse';
+     const manufacturer = await c.shell('getprop ro.product.manufacturer')  || 'Amazon';
+     const model        = await c.shell('getprop ro.product.model')        || 'AEOBC';
+     const serial       = await c.shell('getprop ro.serialno')             || await c.shell('getprop ro.boot.serialno') || 'unknown';
+-
+-    // Full config replacement — single network only, no ambiguity about
+-    // which AP it joins. Deliberately drops any prior (e.g. Alexa-era)
+-    // network entries.
+-    const confLines = [
++    return [
+       'ctrl_interface=/data/misc/wifi/sockets',
+       'driver_param=use_p2p_group_interface=1',
+       'update_config=1',
+@@ -5862,6 +6288,34 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+       '}',
+       '',
+     ].join('\n');
++  }
++
++  async function runConfigWifi(c, ssid, psk) {
++    const plan = planWifi(ssid, psk);
++    const { ssidConf } = plan;
++
++    // Android 5.1's WifiAutoJoinController blocks auto-join after enough
++    // "no internet" reports. Reset the persisted counter before disabling the
++    // source of new reports, so an already-provisioned device recovers too.
++    addLog('Resetting Android WiFi network history…');
++    await c.shell('su -c "rm -f /data/misc/wifi/networkHistory.txt"');
++
++    // On a local-only LAN every connection is flagged, so the counter grows
++    // every reboot until association is suppressed (#317).
++    addLog('Disabling captive portal detection (EchoMuse is local-only)…');
++    await c.shell('su -c "settings put global captive_portal_detection_enabled 0"');
++    const captivePortal = (await c.shell(
++      'su -c "settings get global captive_portal_detection_enabled"')).trim();
++    if (captivePortal !== '0') {
++      throw new Error(`Captive portal detection setting read back ${captivePortal || '(empty)'}, expected 0.`);
++    }
++    addLog('Captive portal detection disabled (read back 0).', 'ok');
++
++    addLog('Enabling WiFi radio…');
++    await c.shell("su -c 'svc wifi enable'");
++    await new Promise(r => setTimeout(r, 2000));
++
++    const confLines = await wpaConfText(c, plan);
+ 
+     addLog(`Writing config for "${ssid}"…`);
+     // The full sequence below was hard-won on real hardware — do not
+@@ -6033,8 +6487,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+   async function skipWifiIfConnected() {
+     setRunning(true);
+     try {
+-      const status = await adb.shell(
+-        "su -c 'wpa_cli -p /data/misc/wifi/sockets -i wlan0 status' 2>&1");
++      const status = await adb.shell(`${wpaCli('status')} 2>&1`);
+       const state = (status.match(/wpa_state=(\S+)/) || [])[1];
+       if (state !== 'COMPLETED') {
+         addLog(`Not skipping: the device reports wpa_state=${state || 'nothing readable'}, `
+@@ -6043,7 +6496,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+       }
+       const ssidRaw = (status.match(/^ssid=(.+)$/m) || [])[1];
+       const ssid = ssidRaw ? _ssidText(_wpaUnescape(ssidRaw.replace(/\r$/, ''))) : null;
+-      const ip   = (await adb.shell(
++      const ip   = isDonut ? await wlanIp(adb) : (await adb.shell(
+         "su -c 'ip addr show wlan0 | grep \"inet \" | while read proto addr rest; do echo ${addr%/*}; done'")).trim();
+       if (!/\d+\.\d+\.\d+\.\d+/.test(ip)) {
+         addLog(`Not skipping: associated to "${ssid || '?'}" but with no IP address, `
+@@ -6051,8 +6504,11 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+         return;
+       }
+       addLog(`Already connected to "${ssid || '?'}" (${ip}) — skipping WiFi setup.`, 'ok');
+-      markStep(10, 'done');
+-      setStep(11);
++      // By id: WiFi is step 10 of 13 in the FireOS flow and the last step in
++      // the Dot 3's.
++      const wi = idxOf('wifi');
++      markStep(wi, 'done');
++      if (wi < STEPS.length - 1) setStep(wi + 1);
+     } catch (e) {
+       addLog(`Could not confirm the device is already connected: ${e.message}`, 'error');
+     } finally {
+@@ -6451,7 +6907,11 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+     // (cryptography package missing) — provision proceeds plain, and the
+     // device can be paired later.
+     addLog('Fetching device-link TLS credentials…');
+-    const serial = (await c.shell('getprop ro.serialno')).trim();
++    // Dot 3: this runs in TWRP, whose ro.serialno is the recovery's idea of
++    // it. The token has to match what FireOS reports, which Connect Device
++    // read (from FireOS when it started there).
++    const serial = (isDonut && provSerial)
++      || (await c.shell('getprop ro.serialno')).trim();
+     if (!serial) {
+       addLog('Could not read device serial — skipping TLS credential install.', 'warn');
+     } else {
+@@ -6571,9 +7031,328 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+     // runInstallOwwAssets. Anything added after that must move it again.
+     addLog(isEmos
+       ? 'Staying in recovery — the wake word assets install next, then emOS is built and flashed.'
++      : isDonut
++      ? 'Staying in recovery — the wake word assets install next, then the device reboots to FireOS.'
+       : 'Staying connected — the wake word assets install next, then the device reboots.');
+   }
+ 
++  // ── Echo Dot 3rd gen flow ────────────────────────────────────────────────
++
++  // Step 2 (TWRP). Applies _DONUT_SETUP_SCRIPT, supplying the two binaries it
++  // may need, and flashes boot-root.zip first when Connect Device found adbd
++  // unrooted under FireOS.
++  async function runDonutPatchSystem(c) {
++    // Bumped whenever this step changes, so a log says which build ran —
++    // a local add-on keeps the same version string across rebuilds.
++    addLog('Patch System — Dot 3 wizard rev 6 (uploads copied into place before running).');
++    const T = await deviceTools(c);
++    if (!T.md5sum) throw new Error('This recovery has no md5sum, so pushed files cannot be verified.');
++    // c.push returns once the bytes are handed to `cat`, not once cat has
++    // written them — it cannot wait for cat to exit (TWRP's cat keeps stdout
++    // open). So the file can still be short or empty when the next command
++    // runs; Patch System once ran its script as an empty file and printed
++    // nothing at all. Poll the checksum until it matches rather than
++    // checking once, and only then treat the file as there.
++    //
++    // And it lands under a temporary name, then is COPIED to the real one.
++    // TWRP's cat may never exit, so it keeps the uploaded file open for
++    // writing, and the kernel refuses to execute a file in that state: Patch
++    // System's busybox check failed with "Text file busy" on a busybox whose
++    // checksum had matched. The copy is a fresh file nothing holds open.
++    const pushChecked = async (path, bytes, label) => {
++      const part = `${path}.part`;
++      await c.shell(`rm -f ${part} ${path}`);
++      await c.push(part, bytes, pct => setProgress({ label: `Uploading ${label}`, pct }));
++      setProgress(null);
++      const want = await _md5Hex(bytes);
++      const sum = async p => (await c.shell(`${T.md5sum} ${p} 2>/dev/null`)).trim().split(/\s+/)[0];
++      for (let i = 0; i < 20; i++) {
++        if (await sum(part) === want) {
++          await c.shell(`cp ${part} ${path} && chmod 755 ${path}; rm -f ${part}`);
++          if (await sum(path) === want) return;
++          break;
++        }
++        await new Promise(r => setTimeout(r, 250));
++      }
++      await c.shell(`rm -f ${part} ${path}`);
++      throw new Error(`${label} did not arrive intact in /tmp — nothing has been written. Retry.`);
++    };
++    // busybox is staged as /tmp/em/busybox, NAMED busybox: it picks the applet
++    // from the name it runs under, so as /tmp/em-busybox it looked for an
++    // applet called "em-busybox" and every call failed with "applet not found".
++    await c.shell('rm -rf /tmp/em /tmp/em-busybox; rm -f /tmp/em-magiskpolicy /tmp/em-donut-setup.sh; mkdir -p /tmp/em');
++
++    let bootRoot = null;
++    if (bootRootFile) {
++      bootRoot = new Uint8Array(await bootRootFile.arrayBuffer());
++      const mp = await _zipEntry(bootRoot, 'patch/magiskpolicy32');
++      // A bare magiskpolicy32 is accepted too, for anyone who unpacked it.
++      const bin = mp || (_isElfArm32(bootRoot) ? bootRoot : null);
++      if (!_isElfArm32(bin)) {
++        throw new Error(`${bootRootFile.name} has no patch/magiskpolicy32 (32-bit ARM). `
++          + 'Choose the boot-root.zip used to root this Echo Dot 3rd gen.');
++      }
++      await pushChecked('/tmp/em-magiskpolicy', bin, 'magiskpolicy');
++      addLog(`magiskpolicy staged from ${bootRootFile.name}.`);
++      if (!mp) bootRoot = null;   // a bare binary is not something to flash
++    }
++
++    if (busyboxFile) {
++      const raw = new Uint8Array(await busyboxFile.arrayBuffer());
++      const bin = _isElfArm32(raw) ? raw : await _zipEntry(raw, 'busybox');
++      if (!_isElfArm32(bin)) {
++        throw new Error(`${busyboxFile.name} is not a 32-bit ARM busybox, and is not a zip `
++          + 'containing one. The Dot 3 runs a 32-bit kernel: use emos-payload.zip from an '
++          + 'emOS release, or any static ARMv7 busybox.');
++      }
++      await pushChecked('/tmp/em/busybox', bin, 'busybox');
++      addLog(`busybox staged from ${busyboxFile.name}.`);
++    }
++
++    if (donutNeedsRootRef.current) {
++      if (!bootRoot) {
++        throw new Error('adb was not root under FireOS, so boot-root has to be flashed and '
++          + 'this step needs your boot-root.zip itself. Choose it above and retry.');
++      }
++      addLog('Flashing boot-root.zip (adb was not root under FireOS)…', 'warn');
++      await pushChecked('/tmp/em-boot-root.zip', bootRoot, 'boot-root.zip');
++      const out = (await c.shell('twrp install /tmp/em-boot-root.zip 2>&1; echo "_RC=$?"')).trim();
++      out.split('\n').filter(l => l.trim() && !l.startsWith('_RC=')).forEach(l => addLog(`  ${l}`));
++      await c.shell('rm -f /tmp/em-boot-root.zip');
++      if (!/_RC=0\s*$/.test(out)) {
++        throw new Error('twrp install of boot-root.zip did not succeed (see above). The system '
++          + 'partition has not been touched.');
++      }
++      donutNeedsRootRef.current = false;
++      addLog('boot-root installed.', 'ok');
++    }
++
++    addLog('Patching the system partition…');
++    await pushChecked('/tmp/em-donut-setup.sh', new TextEncoder().encode(_DONUT_SETUP_SCRIPT), 'setup script');
++    const out = await c.shell('sh /tmp/em-donut-setup.sh 2>&1');
++    if (!out.trim()) {
++      throw new Error('The system patch script ran but printed nothing, so it cannot be told '
++        + 'whether anything was changed. Retry; if it happens again, run '
++        + '`adb shell sh /tmp/em-donut-setup.sh` by hand and send the output.');
++    }
++    await c.shell('rm -f /tmp/em-donut-setup.sh /tmp/em-magiskpolicy /tmp/sepolicy.new');
++    out.split('\n').map(l => l.replace(/\r$/, ''))
++      .filter(l => l.trim() && !/^_DONUT_|^NEED_|^BAD_/.test(l))
++      .forEach(l => addLog(`  ${l}`, l.startsWith('[X]') ? 'error' : l.startsWith('[!]') ? 'warn' : 'info'));
++    if (out.includes('BAD_BUSYBOX')) {
++      throw new Error(`${busyboxFile?.name || 'The chosen busybox'} would not run in TWRP — the `
++        + '[!] lines above say why. If it is a FireOS build, the static one in emos-payload.zip '
++        + 'avoids that; if the reason mentions /tmp or noexec, no busybox will run from there. '
++        + 'Nothing was written.');
++    }
++    if (out.includes('NEED_BUSYBOX')) {
++      throw new Error('This device has no busybox yet, so one is needed: choose '
++        + 'emos-payload.zip (from an emOS release) or a static ARMv7 busybox above, '
++        + 'then retry. Nothing was written.');
++    }
++    if (out.includes('NEED_MAGISKPOLICY')) {
++      throw new Error('The SELinux policy has not been patched on this device yet, which '
++        + 'needs magiskpolicy from your boot-root.zip. Choose it above and retry. '
++        + 'Nothing was written.');
++    }
++    if (!out.includes('_DONUT_SETUP_OK')) {
++      throw new Error('The system patch did not complete (see the lines above). It is safe '
++        + 'to retry — every edit checks whether it is already done — and each file it '
++        + 'changed has its original in /em-backup on the system partition.');
++    }
++    addLog('System partition patched. Originals are in /em-backup on the system partition.', 'ok');
++  }
++
++  // Step 5. Out of TWRP and into FireOS. `twrp reboot system` rather than a
++  // bare reboot: it clears TWRP's own reboot-to-recovery request, which a
++  // plain `reboot` from recovery can leave set.
++  async function runDonutReboot(c) {
++    addLog('Rebooting to FireOS…');
++    expectDisconnect.current = true;
++    try { await c.shell('twrp reboot system 2>/dev/null || reboot'); } catch {}
++    try { await c.close(); } catch {}
++    setAdb(null);
++    addLog('Device rebooting. Click Reconnect as soon as it appears in the USB picker — '
++         + 'the wizard waits for boot to finish by itself.', 'warn');
++    return null;
++  }
++
++  // IP of wlan0, or '' — from ifconfig, which both toybox and busybox answer
++  // in a form this reads. `ip` output differs on this build.
++  async function wlanIp(c) {
++    const out = await c.shell('ifconfig wlan0 2>/dev/null');
++    const m = out.match(/inet (?:addr:)?(\d+\.\d+\.\d+\.\d+)/);
++    return m && m[1] !== '127.0.0.1' ? m[1] : '';
++  }
++
++  // Step 7 (FireOS). Confirms each Patch System edit held across a real boot.
++  // No package manager here — app_process does not exist on this build — so
++  // "booted" is sys.boot_completed alone.
++  async function runDonutVerify(c) {
++    const started = Date.now();
++    let lastNote = -15;
++    setWaiting(true);
++    try {
++      while ((await c.shell('getprop sys.boot_completed')).trim() !== '1') {
++        const t = Math.floor((Date.now() - started) / 1000);
++        if (t > 300) throw new Error('FireOS has not finished booting after 5 minutes. Check '
++          + 'the light ring for a bootloop; the system edits can be undone from TWRP with '
++          + 'the files in /em-backup.');
++        if (t - lastNote >= 15) { lastNote = t; addLog(`  [${t}s] still booting…`); }
++        await new Promise(r => setTimeout(r, 2000));
++      }
++    } finally {
++      setWaiting(false);
++    }
++    addLog('Boot completed.', 'ok');
++
++    const uid = (await c.shell('id -u')).trim();
++    if (uid !== '0') {
++      throw new Error(`adb is not root under FireOS (uid ${uid || '?'}), so boot-root is not `
++        + 'active. Reboot to TWRP, install your boot-root.zip, and Retry from Reconnect.');
++    }
++    addLog('adb is root.', 'ok');
++
++    // Init starts EchoMuse at boot_completed. It is a oneshot running
++    // start_server.sh, which stays up supervising the server, so "running" is
++    // the healthy state; no property at all means init never tried.
++    let svc = '';
++    for (let i = 0; i < 10 && !svc; i++) {
++      svc = (await c.shell('getprop init.svc.echomuse')).trim();
++      if (!svc) await new Promise(r => setTimeout(r, 1000));
++    }
++    const tmp = !!(await c.shell('grep " /tmp " /proc/mounts')).trim();
++    addLog(`  init.svc.echomuse=${svc || '(never started)'}, /tmp ${tmp ? 'mounted' : 'NOT mounted'}, `
++         + `SELinux ${(await c.shell('getenforce 2>&1')).trim()}`);
++    if (!svc) {
++      throw new Error('init never started EchoMuse. /system/etc/init/init.echomuse.rc is '
++        + 'missing or was not parsed — re-run Patch System from TWRP.');
++    }
++    if (svc !== 'running') {
++      const tail = (await c.shell('tail -n 15 /data/local/etc/echomuse/supervisor.log 2>/dev/null; '
++        + 'dmesg | grep -i echomuse | tail -n 5')).trim();
++      if (tail) tail.split('\n').forEach(l => addLog(`  ${l}`));
++      throw new Error(`EchoMuse's service is "${svc}" rather than running. Exit 127 in dmesg `
++        + 'means the SELinux patch is missing — re-run Patch System from TWRP.');
++    }
++    addLog('EchoMuse started by init.', 'ok');
++
++    const bb = (await c.shell('/system/xbin/busybox true 2>&1 && echo _BB')).includes('_BB');
++    addLog(bb ? '  /system/xbin/busybox runs.' : '  /system/xbin/busybox does not run — '
++      + 'controller file transfers will fail.', bb ? 'info' : 'warn');
++
++    // The Amazon stack should be absent. If any of it is up, the trigger it
++    // came from was missed — stop it for now, and say so, because it will be
++    // back next boot.
++    const alexa = (await c.shell("ps | grep -E 'PuffinApp|oobed|amakit_server|SmartHomed|commsd' "
++      + '| grep -v grep')).trim();
++    if (alexa) {
++      const names = [...new Set(alexa.split('\n').map(l => l.trim().split(/\s+/).pop().split('/').pop()))];
++      addLog(`Amazon services still started at boot: ${names.join(', ')}. Stopping them for `
++           + 'now; a trigger this wizard does not know about is starting them.', 'warn');
++      for (const svcName of ['puffin', 'amakit_server', 'smarthomed', 'SmartHomed', 'commsd', 'oobed', 'oobe_setup']) {
++        await c.shell(`stop ${svcName} 2>/dev/null`);
++      }
++      for (const bin of names) await c.shell(`killall ${bin} 2>/dev/null`);
++    } else {
++      addLog('Alexa services are down.', 'ok');
++    }
++
++    const amp = (await c.shell('cat /sys/bus/i2c/devices/2-0044/name 2>/dev/null')).trim();
++    if (amp === 'tas2770') {
++      addLog('  Speaker amp: TAS2770. The installed EchoMuse build needs the Dot 3 audio '
++           + 'changes for sound; without them the device works but stays silent.');
++    }
++  }
++
++  // Scan with the device's own supplicant. On the Dot 3 there is no
++  // framework to ask (`svc wifi` needs app_process), and Patch System's boot
++  // trigger has already started wpa_supplicant; start it if it is not up.
++  async function scanWifiNative(c) {
++    addLog('Scanning for WiFi networks…');
++    await c.shell('ifconfig wlan0 up 2>/dev/null; '
++      + '[ "$(getprop init.svc.wpa_supplicant)" = running ] || start wpa_supplicant');
++    await new Promise(r => setTimeout(r, 2000));
++    await c.shell(wpaCli('scan'));
++    await new Promise(r => setTimeout(r, 3000));
++    const raw = await c.shell(wpaCli('scan_results'));
++    addLog('Scan complete.');
++    return parseScanResults(raw);
++  }
++
++  // Step 8 (FireOS). The join, without Android's WiFi framework, which does
++  // not run on this build. Patch System already made wpa_supplicant and
++  // dhcpcd (as the dhcpcd_wlan0 service) start at every boot, so this writes
++  // the network, asks the running supplicant to re-read it, and waits for a
++  // lease — and the same config rejoins by itself on every later boot.
++  async function runDonutWifi(c, ssid, psk) {
++    const plan = planWifi(ssid, psk);
++    const conf = await wpaConfText(c, plan);
++    const CONF = '/data/misc/wifi/wpa_supplicant.conf';
++    const T = await deviceTools(c);
++    addLog(`Writing config for "${ssid}"…`);
++    // Staged in /data/local/tmp: there is no /sdcard to go through, and the
++    // same no-redirect rule as the FireOS path applies (tee, never `>`).
++    const bytes = new TextEncoder().encode(conf);
++    const b64 = btoa(Array.from(bytes, b => String.fromCharCode(b)).join(''));
++    await c.shell('mkdir -p /data/local/tmp /data/misc/wifi/sockets; chmod 770 /data/misc/wifi; '
++      + 'rm -f /data/local/tmp/em-wpa.conf');
++    await c.shell(`echo ${b64} | ${T.base64} -d | ${T.tee} /data/local/tmp/em-wpa.conf >/dev/null`);
++    await c.shell(`cp /data/local/tmp/em-wpa.conf ${CONF} && chown 1010:1010 ${CONF} `
++      + `&& chmod 660 ${CONF}; rm -f /data/local/tmp/em-wpa.conf`);
++    const onDevice = await c.shell(`cat ${CONF}`);
++    if (!onDevice.includes(plan.ssidConf)) {
++      throw new Error(`${CONF} does not contain ${plan.ssidConf} after the write. `
++        + `On-device content:\n${onDevice}`);
++    }
++    addLog('Config written and verified on device.', 'ok');
++
++    await c.shell('ifconfig wlan0 up 2>/dev/null');
++    const running = (await c.shell('getprop init.svc.wpa_supplicant')).trim() === 'running';
++    if (!running) {
++      addLog('wpa_supplicant not running — starting it.', 'warn');
++      await c.shell('start wpa_supplicant');
++      await new Promise(r => setTimeout(r, 3000));
++    }
++    await c.shell(`${wpaCli('reconfigure')} >/dev/null 2>&1; ${wpaCli('reconnect')} >/dev/null 2>&1`);
++
++    addLog('Waiting for association (up to 20s)…');
++    let lastStatus = '', associated = false;
++    for (let i = 0; i < 20; i++) {
++      await new Promise(r => setTimeout(r, 1000));
++      lastStatus = await c.shell(wpaCli('status'));
++      const st = (lastStatus.match(/wpa_state=(\S+)/) || [])[1];
++      addLog(`  [${i + 1}s] wpa_state=${st || '?'}`);
++      if (st === 'COMPLETED') { associated = true; break; }
++    }
++    if (!associated) {
++      await reportWhyNoAssociation(c, ssid);
++      throw new Error(`Did not associate to "${ssid}" within 20s. Last status:\n${lastStatus}`);
++    }
++    addLog('Associated.', 'ok');
++
++    addLog('Waiting for an IP address…');
++    for (let i = 0; i < 30; i++) {
++      // dhcpcd_wlan0 (from Patch System) normally takes the lease by itself.
++      // Nudge it once if it has not after 8s, rather than starting a second,
++      // unmanaged dhcpcd beside it.
++      if (i === 8) {
++        addLog('  no lease yet — restarting dhcpcd_wlan0');
++        await c.shell('stop dhcpcd_wlan0; start dhcpcd_wlan0');
++      }
++      await new Promise(r => setTimeout(r, 1000));
++      const ip = await wlanIp(c);
++      if (ip) {
++        addLog(`Connected! IP: ${ip}`, 'ok');
++        addLog('EchoMuse is already running and will find the controller over mDNS '
++             + 'within about 30s. The device rejoins this network by itself on every boot.', 'ok');
++        return;
++      }
++    }
++    throw new Error(`Associated to "${ssid}" but got no IP within 30s. Check that `
++      + 'dhcpcd_wlan0 is in /init.connectivity.rc (Patch System adds it).');
++  }
++
+   // ── emOS flow ─────────────────────────────────────────────────────────────
+ 
+   // TWRP is root already but it is not Android, and the install steps below
+@@ -7892,6 +8671,11 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+       addLog('Staying in recovery — the image is built and flashed next.', 'ok');
+       return;
+     }
++    // Dot 3: installed from TWRP, and the reboot is its own step next.
++    if (isDonut) {
++      addLog('Staying in recovery — reboot to FireOS next.', 'ok');
++      return;
++    }
+     addLog('Rebooting device to finish provisioning…');
+     expectDisconnect.current = true;
+     try { await c.shell('su -c reboot'); } catch {}
+@@ -7975,6 +8759,22 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+         case 7: await runRebootAndWatch(c); break;
+         case 8: await runEmosWifi(useLatest); break;
+       }
++      else if (isDonut) switch (stepIdx) {
++        case 0: c = await runConnectAndroid(); break;
++        case 1: c = await runConnectTwrp(); break;
++        case 2: await runDonutPatchSystem(c); break;
++        // The su shim and /sdcard link live in the recovery ramdisk, so each
++        // TWRP step re-establishes them, as in the emOS flow. No WiFi NVRAM
++        // write: FireOS runs nvram_daemon itself on this device.
++        case 3: await prepareTwrpForInstall(c);
++                await runInstallEchoMuse(c, binaryFile, useLatest); break;
++        case 4: await prepareTwrpForInstall(c);
++                await runInstallOwwAssets(c); break;
++        case 5: c = await runDonutReboot(c); break;
++        case 6: c = await runReconnect(); break;
++        case 7: await runDonutVerify(c); break;
++        case 8: await runDonutWifi(c, wifiSsid, wifiPsk); break;
++      }
+       else switch (stepIdx) {
+         case  0: c = await runConnectAndroid(); break;
+         case  1: c = await runConnectTwrp(); break;
+@@ -8046,7 +8846,10 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+     // The flash (6) and the two serial steps stay manual, deliberately: each
+     // is a partition write or a reboot, and neither should begin while nobody
+     // is looking.
+-    const autoSteps = isEmos ? new Set([2, 4, 5]) : new Set([2, 4, 7, 8, 9, 12]);
++    // Dot 3: the assets (4) and Verify (7) need nothing from the operator.
++    // Patch System (2) stays a button — it takes files, and it writes the
++    // system partition.
++    const autoSteps = isEmos ? new Set([2, 4, 5]) : isDonut ? new Set([4, 7]) : new Set([2, 4, 7, 8, 9, 12]);
+     // Connect to TWRP runs itself when the device is ALREADY in TWRP.
+     //
+     // Step 1 keeps its handle when it finds the device in recovery, so step 2
+@@ -8054,7 +8857,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+     // for a click to be told "still connected" is a button whose only possible
+     // outcome is yes. It stays manual in every other case, because then it
+     // genuinely means "I have got the device into TWRP, go and look".
+-    const alreadyThere = isEmos && step === 1 && adb
++    const alreadyThere = (isEmos || isDonut) && step === 1 && adb
+                       && _bannerMode(adb.banner) === 'twrp';
+     if ((!autoSteps.has(step) && !alreadyThere)
+         || running || restored || stepState[step] !== 'pending') return;
+@@ -8069,7 +8872,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+     addLog(`"${STEPS[step].label}" needs an ADB connection and there isn't one — `
+          + `the previous step disconnected the device. Reconnect and click Retry.`, 'error');
+     markStep(step, 'error');
+-  }, [step, running, adb, restored]);
++  }, [step, running, adb, restored, flow]);
+ 
+   const cur    = STEPS[step];
+   const isDone = step === STEPS.length - 1 && stepState[step] === 'done';
+@@ -8133,7 +8936,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+         <div style={{ background: 'linear-gradient(180deg,var(--card),var(--bg))', borderBottom: '1px solid var(--border-hard)', padding: '20px 24px 16px', boxShadow: '0 1px 0 var(--sheen) inset', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+           <div>
+             <div style={{ fontFamily: "'DM Sans',sans-serif", fontSize: 22, fontWeight: 600, color: 'var(--text)', letterSpacing: '-0.02em' }}>Provision Echo Dot</div>
+-            <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--muted)', letterSpacing: '0.12em', textTransform: 'uppercase', marginTop: 4 }}>Chrome/Edge only · USB-A cable · amonet-biscuit prerequisite</div>
++            <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--muted)', letterSpacing: '0.12em', textTransform: 'uppercase', marginTop: 4 }}>Chrome/Edge only · USB-A cable · {isDonut ? 'amonet + TWRP + boot-root prerequisite' : 'amonet-biscuit prerequisite'}</div>
+           </div>
+           <CircleButton onClick={onClose} title="Close">×</CircleButton>
+         </div>
+@@ -8233,6 +9036,12 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+                     { id: 'fireos', name: 'FireOS + root',
+                       sub: 'Keeps Android. Every device in the field runs this.',
+                       warn: 'The 3.5mm jack is unreliable on this path.' },
++                    // Picked automatically when Connect Device finds a Dot 3,
++                    // whichever of these is selected — offered here as well so
++                    // the steps shown match the device from the start.
++                    { id: 'donut', name: 'Echo Dot 3rd gen',
++                      sub: 'Keeps FireOS 6. Chosen for you if a Dot 3 is connected.',
++                      warn: 'Needs a build with the Dot 3 audio changes for sound.' },
+                   ].map(o => (
+                     <div key={o.id} onClick={() => chooseFlow(o.id)}
+                       style={{
+@@ -8293,16 +9102,40 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+               </div>
+             )}
+ 
+-            {/* Step 5: reboot button (FireOS flow only — emOS step 5 builds the image) */}
+-            {!isEmos && step === 5 && stepState[5] === 'pending' && !running && (
++            {/* Step 5: reboot button (FireOS and Dot 3 — emOS step 5 builds the image) */}
++            {(isFireos || isDonut) && step === 5 && stepState[5] === 'pending' && !running && (
+               <div style={{ marginBottom: 10 }}>
+-                <Pill onClick={() => runStep(5)}>Reboot to Android</Pill>
++                <Pill onClick={() => runStep(5)}>{isDonut ? 'Reboot to FireOS' : 'Reboot to Android'}</Pill>
++              </div>
++            )}
++
++            {/* Dot 3 step 2: the two binaries Patch System may need. Both are
++                optional on a device that already has them, and the step says
++                which one is missing before it writes anything. */}
++            {isDonut && step === 2 && stepState[2] !== 'done' && !running && (
++              <div style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
++                <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--text2)', letterSpacing: '0.08em' }}>
++                  BOOT-ROOT.ZIP — THE ONE USED TO ROOT THIS DOT (MAGISKPOLICY IS TAKEN FROM IT)
++                </div>
++                <input type="file" accept=".zip"
++                  onChange={e => setBootRootFile(e.target.files[0] || null)}
++                  style={{ fontFamily: "'DM Mono',monospace", fontSize: 11 }} />
++                <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--text2)', letterSpacing: '0.08em', marginTop: 4 }}>
++                  BUSYBOX — EMOS-PAYLOAD.ZIP FROM AN EMOS RELEASE, OR A STATIC ARMV7 BUSYBOX
++                </div>
++                <input type="file"
++                  onChange={e => setBusyboxFile(e.target.files[0] || null)}
++                  style={{ fontFamily: "'DM Mono',monospace", fontSize: 11 }} />
++                <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--muted)', lineHeight: 1.6 }}>
++                  Re-running on a device that has been patched before needs neither.
++                </div>
++                <div><Pill accent onClick={() => runStep(2)}>Patch System</Pill></div>
+               </div>
+             )}
+ 
+             {/* Step 3: Magisk zip file picker — stays visible through error so a
+                 different file can be picked, not just gone after one attempt */}
+-            {!isEmos && step === 3 && stepState[3] !== 'done' && !running && (
++            {isFireos && step === 3 && stepState[3] !== 'done' && !running && (
+               <div style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                 <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--text2)', letterSpacing: '0.08em' }}>
+                   {stepState[3] === 'error' ? 'SELECT A DIFFERENT FILE' : 'MAGISK-V17.3.ZIP'}
+@@ -8319,7 +9152,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+             {/* Step 11: EchoMuse binary — custom upload or latest from controller.
+                 Stays visible through error so a different file/source can be
+                 tried instead of being stuck retrying whatever failed. */}
+-            {!isEmos && step === 11 && stepState[11] !== 'done' && !running && (
++            {isFireos && step === 11 && stepState[11] !== 'done' && !running && (
+               <div style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', gap: 10 }}>
+                 <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                   <Pill accent onClick={() => runStep(11, true)}>Install latest from GitHub</Pill>
+@@ -8345,10 +9178,17 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+               </div>
+             )}
+ 
+-            {/* emOS step 3: the EchoMuse binary, same choice the FireOS flow
+-                offers at its step 11. */}
+-            {isEmos && step === 3 && stepState[3] !== 'done' && !running && (
++            {/* emOS and Dot 3 step 3: the EchoMuse binary, same choice the
++                FireOS flow offers at its step 11. */}
++            {(isEmos || isDonut) && step === 3 && stepState[3] !== 'done' && !running && (
+               <div style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', gap: 10 }}>
++                {isDonut && (
++                  <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: 'var(--warn)', lineHeight: 1.6 }}>
++                    The speaker on the Dot 3 only works with a build that has the Dot 3 audio
++                    changes (TAS2770 volume, the 48 kHz clock anchor, no gpio444). If the
++                    release does not have them yet, install your own build below.
++                  </div>
++                )}
+                 <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                   <Pill accent onClick={() => runStep(3, true)}>Install latest from GitHub</Pill>
+                   <Pill small onClick={doCheckRelease} disabled={checkingRelease}>
+@@ -8412,7 +9252,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+             {/* FireOS: steps 2-4, the TWRP steps after its escrow (#468). Magisk
+                 at step 3 rewrites the boot partition too, so the restore undoes
+                 both. Not offered once Android is up — no TWRP, no restore. */}
+-            {(isEmos ? (step === 6 || step === 7) : (step >= 2 && step <= 4))
++            {(isEmos ? (step === 6 || step === 7) : isFireos && (step >= 2 && step <= 4))
+               && stepState[step] === 'error' && !running && (
+               <div className="em-inset" style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', gap: 8, padding: 10 }}>
+                 <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: 'var(--text2)' }}>
+@@ -8496,7 +9336,19 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
+               />
+             )}
+             {/* Step 10: WiFi configuration (FireOS flow — emOS configures WiFi over the console at step 8) */}
+-            {!isEmos && step === 10 && stepState[10] !== 'done' && !running && (
++            {/* Dot 3 step 8: the same panel, driven natively — see runDonutWifi. */}
++            {isDonut && step === 8 && stepState[8] !== 'done' && !running && (
++              <WifiPanel
++                ready={adb}
++                wifiSsid={wifiSsid} setWifiSsid={setWifiSsid}
++                wifiPsk={wifiPsk}   setWifiPsk={setWifiPsk}
++                onScan={() => scanWifiNative(adb).then(nets => setWifiNetworks(nets)).catch(e => addLog(`Scan failed: ${e.message}`, 'error'))}
++                networks={wifiNetworks}
++                onConnect={() => { if (wifiSsid) runStep(8); }}
++                onSkip={skipWifiIfConnected}
++              />
++            )}
++            {isFireos && step === 10 && stepState[10] !== 'done' && !running && (
+               <WifiPanel
+                 ready={adb}
+                 wifiSsid={wifiSsid} setWifiSsid={setWifiSsid}
+diff --git a/controller/tests/test_deploy.py b/controller/tests/test_deploy.py
+index 4276324..52e46e0 100644
+--- a/controller/tests/test_deploy.py
++++ b/controller/tests/test_deploy.py
+@@ -516,14 +516,15 @@ def test_the_wake_word_asset_wizard_step_is_mandatory():
+     auto_line = jsx[jsx.index("const autoSteps ="):]
+     auto_line = auto_line[:auto_line.index("\n")]
+     sets = re.findall(r"new Set\(\[([^\]]*)\]\)", auto_line)
+-    assert len(sets) == 2, (
++    assert len(sets) == 3, (
+         f"expected an autoSteps set per flow, found {len(sets)} in {auto_line!r}")
+-    emos_auto, fireos_auto = [
++    emos_auto, donut_auto, fireos_auto = [
+         {int(n) for n in re.findall(r"\d+", s)} for s in sets
+     ]
+ 
+     for table, auto, flow in (("_WIZARD_STEPS", fireos_auto, "FireOS"),
+-                              ("_EMOS_STEPS", emos_auto, "emOS")):
++                              ("_EMOS_STEPS", emos_auto, "emOS"),
++                              ("_DONUT_STEPS", donut_auto, "Echo Dot 3rd gen")):
+         steps = jsx[jsx.index(f"const {table} = ["):]
+         steps = steps[:steps.index("\n];")]
+         assert "'install_oww'" in steps, \
+@@ -2385,7 +2386,7 @@ def test_the_fireos_flow_escrows_before_it_patches():
+         assert at < writes[0], f"{marker} must come before the partition write"
+ 
+     # And the restore is offered on the TWRP steps that follow the escrow.
+-    assert "(isEmos ? (step === 6 || step === 7) : (step >= 2 && step <= 4))" in src, (
++    assert "(isEmos ? (step === 6 || step === 7) : isFireos && (step >= 2 && step <= 4))" in src, (
+         "the FireOS flow must offer the restore on a failed TWRP step")
+ 
+ 
+diff --git a/controller/tests/wifi_ssid.test.mjs b/controller/tests/wifi_ssid.test.mjs
+index d05d6b6..61d9940 100644
+--- a/controller/tests/wifi_ssid.test.mjs
++++ b/controller/tests/wifi_ssid.test.mjs
+@@ -99,8 +99,16 @@ check("a 64-hex input is already the PSK", await m._wpaPsk("AB".repeat(32), enc(
+ // ── the call sites ──
+ const slice = (from, len) => src.slice(src.indexOf(from), src.indexOf(from) + len);
+ const fire = slice("async function runConfigWifi", 12000);
+-check("FireOS flow writes the SSID through _confSsid", fire.includes("const ssidConf = _confSsid(ssidB)")
+-  && fire.includes("`\\t${ssidConf}`"));
++// The SSID line is built once, in planWifi + wpaConfText, and shared by the
++// FireOS join and the Echo Dot 3rd gen's native one.
++const plan = slice("function planWifi(", 2500);
++const confText = slice("async function wpaConfText(", 4000);
++check("FireOS flow writes the SSID through _confSsid", plan.includes("const ssidConf = _confSsid(ssidB)")
++  && confText.includes("`\\t${ssidConf}`")
++  && fire.includes("planWifi(ssid, psk)") && fire.includes("wpaConfText(c, plan)"));
++const donut = slice("async function runDonutWifi", 6000);
++check("Dot 3 flow uses the same SSID path and verifies it", donut.includes("planWifi(ssid, psk)")
++  && donut.includes("wpaConfText(c, plan)") && donut.includes("includes(plan.ssidConf)"));
+ check("FireOS flow verifies the line it wrote", (fire.match(/includes\(ssidConf\)/g) || []).length === 2);
+ const emos = slice("async function runEmosWifi", 3500);
+ check("emOS flow sends only hex to the console", /setNet\('ssid', ssidHex\)/.test(emos)

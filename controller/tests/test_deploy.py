@@ -516,14 +516,15 @@ def test_the_wake_word_asset_wizard_step_is_mandatory():
     auto_line = jsx[jsx.index("const autoSteps ="):]
     auto_line = auto_line[:auto_line.index("\n")]
     sets = re.findall(r"new Set\(\[([^\]]*)\]\)", auto_line)
-    assert len(sets) == 2, (
+    assert len(sets) == 3, (
         f"expected an autoSteps set per flow, found {len(sets)} in {auto_line!r}")
-    emos_auto, fireos_auto = [
+    emos_auto, donut_auto, fireos_auto = [
         {int(n) for n in re.findall(r"\d+", s)} for s in sets
     ]
 
     for table, auto, flow in (("_WIZARD_STEPS", fireos_auto, "FireOS"),
-                              ("_EMOS_STEPS", emos_auto, "emOS")):
+                              ("_EMOS_STEPS", emos_auto, "emOS"),
+                              ("_DONUT_STEPS", donut_auto, "Echo Dot 3rd gen")):
         steps = jsx[jsx.index(f"const {table} = ["):]
         steps = steps[:steps.index("\n];")]
         assert "'install_oww'" in steps, \
@@ -2385,7 +2386,7 @@ def test_the_fireos_flow_escrows_before_it_patches():
         assert at < writes[0], f"{marker} must come before the partition write"
 
     # And the restore is offered on the TWRP steps that follow the escrow.
-    assert "(isEmos ? (step === 6 || step === 7) : (step >= 2 && step <= 4))" in src, (
+    assert "(isEmos ? (step === 6 || step === 7) : isFireos && (step >= 2 && step <= 4))" in src, (
         "the FireOS flow must offer the restore on a failed TWRP step")
 
 

@@ -6,7 +6,7 @@
 # and it is the file measured on VVV. MIT licensed.
 FROM python:3.12-slim@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9 AS silero
 COPY tools/silero_typed.py /tmp/
-RUN pip install --no-cache-dir --root-user-action=ignore onnx==1.20.1 && \
+RUN pip install --no-cache-dir --root-user-action=ignore onnx==1.20.1 numpy==2.3.5 && \
     python -c "import urllib.request; urllib.request.urlretrieve('https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/silero_vad.onnx', '/tmp/in.onnx')" && \
     echo "a35ebf52fd3ce5f1469b2a36158dba761bc47b973ea3382b3186ca15b1f5af28  /tmp/in.onnx" | sha256sum -c - && \
     python /tmp/silero_typed.py /tmp/in.onnx /silero_vad.onnx && \

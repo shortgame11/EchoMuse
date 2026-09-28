@@ -4006,3 +4006,76 @@ Line out: the jack follows the speaker volume (stock does the same); a
 remembered per-output volume is agreed, not built. #669 (one channel silent with
 clicking on line out) is probably stock's `Right Channel Only`, which we never
 copied.
+
+## 2026-09-27/28 — the Echo Dot 3rd gen on stock FireOS 6, and a wizard flow for it
+
+One Echo Dot 3rd gen (`donut_puffin`, FireOS 6574.1, Android 7.1.2, amonet +
+TWRP 3.7.0 + `boot-root.zip`) taken from "the FireOS flow completes and nothing
+survives a reboot" to wake word, speaker and WiFi working across cold boots, and
+then provisioned end to end by a new wizard flow. The hardware facts are in
+`device/CLAUDE.md` (Echo Dot 3rd gen section) and the flow in
+`controller/CLAUDE.md`; this is how we got there.
+
+**emOS was the first plan and cannot work here.** Its boot image was written to
+`boot_a`, verified by md5, and every reboot came back to stock with no error.
+The device reports `verifiedbootstate=yellow`: still verifying, against a
+non-Amazon key. Reading `boot-root.zip`'s installer showed why it succeeds where
+a whole image fails: it rewrites only the cmdline field and leaves the verified
+kernel and ramdisk byte-identical. So the port is on FireOS, and nothing that
+lives in a boot ramdisk — which is where the FireOS flow puts its init
+additions — ever runs.
+
+**Everything persistent therefore goes on the system partition, from TWRP.**
+`/` is dm-verity with no fstab, so it cannot be remounted from Android; TWRP
+mounts `mmcblk0p13` directly. The first edits "landed" and did nothing because
+`<mnt>/etc` is an absolute symlink into TWRP's own root. Alexa is started by
+property triggers across four files in `/system/etc/init` plus the root
+`init.mt8516.rc`; commenting out the `start` blocks, and only those, keeps it
+down. WiFi needed `ifconfig wlan0 up` plus a `dhcpcd` service, because nothing
+brings the interface up once Alexa's stack is gone.
+
+**The EchoMuse service failed four ways before it ran, each silent.** There was
+no `/tmp` for `start_server.sh` to log to. A parked `init.echomuse.rc.off` was
+still loaded, because Android 7's init reads every file in that directory. A
+service with no `seclabel` is registered and never started, and a service that
+never started has no `init.svc.*` property at all, which reads as "not parsed".
+And SELinux is Enforcing whatever the cmdline says: dmesg showed init denied the
+transition into `su`. Patching `sepolicy` with `magiskpolicy32` from
+`boot-root.zip` needed the device's `/system` bind-mounted, because the binary
+is dynamically linked against FireOS. Then the controller could not send files,
+because it only accepts `busybox` or python for base64 and FireOS 6 has
+toybox's; busybox in `/system/xbin` was the workaround, and a plain-`base64`
+decoder is the upstream fix.
+
+**The speaker took the longest, and the answer was three unrelated clock
+faults.** The TAS2770 shuts itself down on a TDM clock error (register `0x24`,
+bit 2), and it was being starved three ways: the mic capture opened at 16 kHz
+before the loopback, which stock avoids by opening `DL1_AWB_Record` first; the
+volume written on a 0–127 scale to an inverted 0–255 control; and the mute-LED
+code exporting `gpio444`, which on this board is SoC pin 57 in its audio
+function. The pin was found last and fixed it outright, and it cost the most
+because **both it and the 16 kHz capture persist until reboot**, so every test
+run after EchoMuse had started once was contaminated. A stock-boot capture
+script (`echomuse-stock-capture.sh`) recorded what Amazon's `mixer` does, which
+is where the loopback-first order came from. The Dot 3's own mute-LED pin is
+still unknown.
+
+**The wizard now has a third flow for it** (`_DONUT_STEPS`), detected from the
+product name before anything is written. Its first hardware run on 2026-09-28
+failed repeatedly in Patch System, and every failure was in how a file reached
+TWRP rather than in what the step did: `adb push` via `cat` returns before the
+file is written, and TWRP's `cat` never exits, so a script once ran as an empty
+file and a checksummed busybox would not execute ("Text file busy"); busybox
+staged as `em-busybox` looked for an applet of that name; and a swallowed
+stderr hid all of it. Uploads now land as `.part`, are checksummed, and are
+copied into place. The next run provisioned the device. The two orange flashes
+it then gave on the wake word were the existing `no_ha` cue: Home Assistant had
+not yet adopted it.
+
+**Also found:** a local add-on build dies on a `kvm64` Home Assistant VM because
+the `silero` build stage installs numpy unpinned (2.5.3 needs x86-64-v2); pinned
+to 2.3.5 like `requirements.txt`.
+
+**Open:** the mute-LED pin; the base64 decoder upstream; `assetmgrd`'s trigger;
+the jack reconciler on this board; and a board switch for the firmware changes,
+whose host tests still pin biscuit values.

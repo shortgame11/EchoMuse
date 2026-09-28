@@ -99,8 +99,16 @@ check("a 64-hex input is already the PSK", await m._wpaPsk("AB".repeat(32), enc(
 // ── the call sites ──
 const slice = (from, len) => src.slice(src.indexOf(from), src.indexOf(from) + len);
 const fire = slice("async function runConfigWifi", 12000);
-check("FireOS flow writes the SSID through _confSsid", fire.includes("const ssidConf = _confSsid(ssidB)")
-  && fire.includes("`\\t${ssidConf}`"));
+// The SSID line is built once, in planWifi + wpaConfText, and shared by the
+// FireOS join and the Echo Dot 3rd gen's native one.
+const plan = slice("function planWifi(", 2500);
+const confText = slice("async function wpaConfText(", 4000);
+check("FireOS flow writes the SSID through _confSsid", plan.includes("const ssidConf = _confSsid(ssidB)")
+  && confText.includes("`\\t${ssidConf}`")
+  && fire.includes("planWifi(ssid, psk)") && fire.includes("wpaConfText(c, plan)"));
+const donut = slice("async function runDonutWifi", 6000);
+check("Dot 3 flow uses the same SSID path and verifies it", donut.includes("planWifi(ssid, psk)")
+  && donut.includes("wpaConfText(c, plan)") && donut.includes("includes(plan.ssidConf)"));
 check("FireOS flow verifies the line it wrote", (fire.match(/includes\(ssidConf\)/g) || []).length === 2);
 const emos = slice("async function runEmosWifi", 3500);
 check("emOS flow sends only hex to the console", /setNet\('ssid', ssidHex\)/.test(emos)

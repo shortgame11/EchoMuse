@@ -1160,7 +1160,120 @@ Playback ring clearing waits for the device's `playback_stats` (`device.playback
   such driver and we drive gpio444 ourselves. Never read its
   `power_button_state`: it blocked the console.
 - **Mute ring** (solid red) is device-sovereign — enforced since v2.7.8: controller LED writes are recorded but not painted while muted. Needed because muting now terminates an active turn (controller cancels + `speaker_flush` on `mute_state`), so the cancelled turn's LED cleanup arrives after the red ring is up.
-- **Volume arc** owns the ring for its 2s display window against *animations* — they repaint ~every 100ms and would otherwise stomp the arc within one frame. It does **not** outrank a deliberate action-button press: a dot release calls `CancelVolumeDisplay()`, which drops the hold so the listening frame paints (it deliberately does not repaint — the controller's frame lands within an RTT, and clearing to black would put a dark gap between the two). The arc is protection from repaint churn, not from the user. On expiry the ring repaints the latest `baseLEDs` frame (`onDisplayExpire` → `paintBaseLEDs`), handing back mid-animation. The arc shows only for physical volume button presses (v2.9.5): remote sets and the boot-time volume seed apply silently (`volumeController.Set` showRing flag). The mute-button LED is sysfs gpio444, active-high — not the gpio445 in Amazon's `libled_hal.so`, whose constant is off by one and whose pad is muxed away (stock drives the pin via the `/dev/mtgpio` ioctl; see `mute_button.go`).
+- **Volume arc** owns the ring for its 2s display window against *animations* — they repaint ~every 100ms and would otherwise stomp the arc within one frame. It does **not** outrank a deliberate action-button press: a dot release calls `CancelVolumeDisplay()`, which drops the hold so the listening frame paints (it deliberately does not repaint — the controller's frame lands within an RTT, and clearing to black would put a dark gap between the two). The arc is protection from repaint churn, not from the user. On expiry the ring repaints the latest `baseLEDs` frame (`onDisplayExpire` → `paintBaseLEDs`), handing back mid-animation. The arc shows only for physical volume button presses (v2.9.5): remote sets and the boot-time volume seed apply silently (`volumeController.Set` showRing flag). The mute-button LED is sysfs gpio444, active-high — not the gpio445 in Amazon's `libled_hal.so`, whose constant is off by one and whose pad is muxed away (stock drives the pin via the `/dev/mtgpio` ioctl; see `mute_button.go`). **On the Echo Dot 3rd gen `gpio444` is an audio pin, and exporting it silences the speaker** — see that board's section below.
+
+## Echo Dot 3rd gen (`donut_puffin`) on stock FireOS 6
+
+The second board, brought up 2026-09-27/28 on one unit: Echo Dot 3rd gen,
+FireOS 6574.1 (Android 7.1.2), rooted with amonet + TWRP 3.7.0 +
+`boot-root.zip`, slot A. EchoMuse runs there with the wake word, speaker output
+and WiFi surviving cold boots. Provisioning is the wizard's third flow (see
+`controller/CLAUDE.md`); this section is the hardware and what the firmware must
+do differently on it. **The speaker fixes below are in the Dot 3 firmware
+changes, not on main as of `f53d14f`**, and they are gated on this board's
+hardware so biscuit is unaffected.
+
+**It stays on FireOS; emOS's boot image cannot boot here.** The bootloader still
+verifies the boot image (`ro.boot.verifiedbootstate=yellow`: verified, against a
+non-Amazon key). `boot-root.zip` works inside that by rewriting only the
+512-byte cmdline field (`buildvariant=userdebug`, keeping `veritykeyid=`) and
+leaving kernel and ramdisk byte-identical. A whole replacement image such as
+`emos-boot.img` changes what is verified and is silently rejected: the device
+boots the stock image again with no error anywhere. The same limit means
+**nothing written to a boot ramdisk reaches a normal boot**, which is why the
+FireOS flow's init additions did nothing on this device.
+
+**Audio hardware** (card 0, `mt-snd-card`, 229 controls):
+
+| | |
+|---|---|
+| Speaker amp | TI **TAS2770**, i2c `2-0044`, kernel `tas2770` ASoC codec |
+| Speaker PCM | `DL1_Playback`, device **6**, fed over I2S |
+| Mics | two `tlv320aic3101` ADCs on `TDM_Capture`, device **1**: 4 ch, S32_LE, 48 kHz |
+| Loopback | `DL1_AWB_Record`, device **7**: 2 ch, S16, 48 kHz, a true hardware echo reference |
+
+TAS2770 registers worth knowing (datasheet SLASEM6E): `0x02` power mode
+(`0x0c` active, `0x0e` software shutdown), `0x05` volume, `0x22`/`0x24` live
+and latched faults, where **bit 2 is TDM clock error**. On a clock error the
+amp shuts itself down. **Every silent-speaker cause found was the amp being
+starved of valid clocks**, three different ways:
+
+- **The mic capture can break the speaker's clock until reboot.** The TDM
+  capture and the speaker's I2S port share a clock. Opening the mic at 16 kHz
+  with nothing else running configures it so the speaker port cannot make a
+  valid 48 kHz frame. At 48 kHz the ADCs return digital zero, so the rate is
+  not the lever. Stock's `mixer` opens the loopback (device 7) **before** the
+  mic, from the same process; reproduced with `tinycap` in both orders. Fix:
+  `startClockAnchor()` in `pcm_microphone.go` opens device 7 and drains it
+  forever, and the mic waits for its first batch. Gated on `pcm7c/info` naming
+  `DL1_AWB_Record`. Also fixed there: `bytesPerFrame` is `Channels * 4` (S32),
+  not `* 3`, which overcounted frames by 4/3 and faked a "capture fast" skew.
+- **`gpio444` is an audio pin on this board.** The mute-LED code exports
+  sysfs `gpio444`, found on biscuit. Here the gpiochip base is 387, so 444 is
+  **SoC pin 57**, which boots in its mode-4 audio function. Exporting it turns
+  it into a GPIO output driven low, and the amp sees invalid clocks until
+  reboot. Read it in `/sys/devices/platform/soc/1000b000.pinctrl/mt_gpio`:
+  `57: 4 0 0 1 …` clean, `57: 0 1 0 0 …` after EchoMuse. `unexport` plus
+  `echo 'mode 57 4'` into that file restores sound without a reboot. Fix:
+  `mute_button.go` does nothing when the TAS2770 is present. **The Dot 3's real
+  mute-LED pin is not yet known**, so the LED is not driven. This is the
+  biscuit lesson again, one board later: a GPIO number is a property of one
+  board, and the write that is wrong on the next one succeeds silently.
+- **Volume is the amp's digital volume, inverted.** `PCM Playback Volume` is
+  0–255 with 255 = 0 dB and −0.5 dB per step; the controller's 0–127 scale was
+  written straight through, so "normal" was about −77 dB. Fix (`volume.go`):
+  when `/sys/bus/i2c/devices/2-0044/name` is `tas2770`, write `level + 128`
+  (0 stays 0) and invert on read.
+
+Smaller, in `pcm_speaker.go`: set stock's routing (`Audio Amp Playback Volume`
+0, `Headset_PGAL/R_GAIN` −2 dB, `LINEOUT Mux` `VOICE_AMP`) **before** opening
+the stream; drop `Playback State` (absent here); open the speaker only once
+`pcm1c` and `pcm7c` are `RUNNING`, which matches stock's order (it did not by
+itself fix anything; pin 57 did); `Close()` mutes but no longer resets
+`LINEOUT Mux`; use `deviceNr`, not a hardcoded 6.
+
+**Testing on this board:**
+
+- **Bisect only from clean boots.** The 16 kHz capture and the pin 57 export
+  both persist until reboot, so any test after EchoMuse has started once on
+  that boot is contaminated. Several wrong conclusions came from exactly that.
+- **The amp only checks its clocks while active.** `0x22 = 0x00` with `0x02 =
+  0x0e` proves nothing: write `0x0c` to `0x02` and read `0x22` straight after.
+- A PCM held by another process makes `tinyplay` block silently in
+  `snd_pcm_open`; the owner is in `/proc/asound/card0/pcmNp/sub0/status`.
+  `tinyplay`/`tinycap` backgrounded inside `adb shell "… &"` hang adb; use
+  `nohup … >/dev/null 2>&1 &`.
+- Renaming `start_server.sh` to keep EchoMuse off only lasts until the
+  controller re-syncs it, as soon as a server connects.
+
+```
+busybox i2cget -f -y 2 0x44 0x02   # power (0x0c active, 0x0e shutdown)
+busybox i2cget -f -y 2 0x44 0x22   # live faults (bit 2 = TDM clock error)
+busybox i2cget -f -y 2 0x44 0x24   # latched faults
+grep -E '^ *57:' /sys/devices/platform/soc/1000b000.pinctrl/mt_gpio   # want mode 4
+```
+
+**The platform, for anyone porting further:** system-as-root with `/` on
+dm-verity (`/dev/dm-0`, no fstab), so `/system` is edited from TWRP by
+mounting the partition (`mmcblk0p13` on slot A). There, `/etc` is an absolute
+symlink into TWRP's own root: use `<mnt>/system/etc/init`, never
+`<mnt>/etc/init`. **Android 7's init loads every file in `/system/etc/init/`
+whatever its extension**, so `foo.rc.off` or `foo.rc.bak` there is still
+loaded; keep backups elsewhere. SELinux is Enforcing and
+`androidboot.selinux=permissive` on the cmdline has no effect; a service in
+the `su` domain needs `seclabel u:r:su:s0` **and** a sepolicy that lets init
+transition into it. There is no `/tmp`, no `/sdcard` under FireOS, no busybox,
+no `ip`, and no `echoaudio` (so `start_server.sh`'s 120 s wait for it is dead
+time here). WiFi has no framework in the loop once Alexa is off:
+`wpa_supplicant` sits at `INTERFACE_DISABLED` until something runs
+`ifconfig wlan0 up`, and DHCP is a `dhcpcd` service.
+
+**Open on this board:** the mute-LED pin; `assetmgrd` still starts from an
+unidentified trigger; the jack-routing reconciler's controls do not exist here
+and it logs "2 controls rewritten" every 30 s; host tests that pin biscuit
+values (routes, speaker device 23, the 9-channel beamformer) need a board
+switch rather than replaced values before any of this is upstream; and
+`DL1_AWB_Record` could replace the software AEC tap on this board.
 
 ## Where the serial comes from
 
