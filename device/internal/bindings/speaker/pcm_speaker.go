@@ -407,6 +407,13 @@ func (p *PcmSpeaker) ReconcileJackRouting() int {
 	if len(drift) == 0 {
 		return 0
 	}
+	// Name them: a count alone cannot tell the HAL rewriting one control from
+	// two of our own writes undoing each other, and the second happened.
+	names := make([]string, len(drift))
+	for i, w := range drift {
+		names[i] = w.Ctl + "=" + w.Args[0]
+	}
+	log.Printf("[speaker] jack routing: restoring %s", strings.Join(names, ", "))
 	p.applyJackWrites(drift)
 	return len(drift)
 }

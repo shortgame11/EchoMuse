@@ -144,12 +144,23 @@ func TestDonutJackRoutingIsStocksHeadphonePath(t *testing.T) {
 		ctlDonutHPOut:        "AUDIO_AMP",
 		ctlDonutLineOut:      "OPEN",
 		ctlDonutHPAmp:        "3",
-		ctlDonutHPGainL:      "-2dB",
-		ctlDonutHPGainR:      "-2dB",
 		mixer.PlaybackVolume: "0",
 	} {
 		if got, _, ok := donutValue(in, ctl); !ok || got != want {
 			t.Errorf("plug in: %s = %q (set %v), want %q", ctl, got, ok, want)
+		}
+	}
+}
+
+// The headset gain and the headphone amp alias on this codec: a table that
+// writes both makes the reconciler rewrite one, which moves the other, every
+// 30s forever. That pulsed the jack between amp 3 and 0 (2026-09-29).
+func TestDonutJackTablesNeverWriteTheAliasedHeadsetGain(t *testing.T) {
+	for _, inserted := range []bool{true, false} {
+		for _, w := range jackRoutingFor(board.Donut, inserted) {
+			if w.Ctl == ctlDonutHPGainL || w.Ctl == ctlDonutHPGainR {
+				t.Errorf("inserted=%v: writes %s, which fights %s", inserted, w.Ctl, ctlDonutHPAmp)
+			}
 		}
 	}
 }

@@ -1295,9 +1295,18 @@ one read loop serves both layouts.
 `/sys/class/switch/h2w` as biscuit, so the existing watcher and reconciler
 serve both boards from per-board tables. On insert: the TAS2770 volume to 0
 (stock's way of silencing the speaker), `Audio Amp Playback Volume` 3/3,
-`Headset_PGAL/R_GAIN` −2 dB, `LINEOUT Mux` OPEN, `HPOUT Mux` AUDIO_AMP; removal
-reverses it, with the speaker unmuted last. That is stock's
-`normal-playback headphone` path from `/system/vendor/etc/mixer_paths.xml`.
+`LINEOUT Mux` OPEN, `HPOUT Mux` AUDIO_AMP; removal reverses it, with the
+speaker unmuted last. That is stock's `normal-playback headphone` path from
+`/system/vendor/etc/mixer_paths.xml`.
+
+**`Headset_PGAL/R_GAIN` and `Audio Amp Playback Volume` alias**: writing one
+moves the other. The first jack table wrote both, so the 30s reconciler
+rewrote one, knocked out the other, and repeated forever, logging "2
+controls" and "1 control" alternately. With a plug in, the jack pulsed
+between amp 3 and 0 on exactly those ticks (2026-09-29). Stock's headphone
+path writes only the amp; a test now keeps the headset gain out of both
+tables. The drift log names what it restores for this reason: two of our own
+writes undoing each other look identical, by count, to the HAL interfering.
 
 It took a day because **a quiet jack reads as a dead one**. The headphone amp
 (0..7) sat at 0 or 1, inaudible through a powered speaker, so every correct

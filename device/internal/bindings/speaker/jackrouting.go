@@ -108,15 +108,23 @@ func jackRouting(inserted bool) []mixerWrite {
 // Stock's own "mixer" daemon notices the plug too (Enabling Lineout,
 // ChangeOutput: to primary hal: lineout) but switches nothing until it opens a
 // stream of its own, which it cannot while we hold DL1.
+//
+// Headset_PGAL/R_GAIN is deliberately NOT in the table. On this codec it and
+// "Audio Amp Playback Volume" read back through the same setting: writing one
+// moves the other. The first version wrote both, so every 30s reconcile found
+// one of them "drifted", rewrote it, and knocked the other out, alternating
+// "2 controls" and "1 control" for as long as a plug was in. The jack pulsed
+// between amp 3 and 0 on exactly the reconcile ticks (measured 2026-09-29).
+// Stock's headphone path writes only the amp, and so do we. Init still sets
+// the headset gain once, before the amp, as stock's speaker path does.
 const (
 	ctlDonutHPOut     = "HPOUT Mux"
 	ctlDonutLineOut   = "LINEOUT Mux"
 	ctlDonutHPAmp     = "Audio Amp Playback Volume"
-	ctlDonutHPGainL   = "Headset_PGAL_GAIN"
+	ctlDonutHPGainL   = "Headset_PGAL_GAIN" // aliases ctlDonutHPAmp; never in a jack table
 	ctlDonutHPGainR   = "Headset_PGAR_GAIN"
-	donutHPAmpJack    = "3"    // stock's headphone path
-	donutHPAmpSpeaker = "0"    // stock's speaker path, and what Init sets
-	donutHPGain       = "-2dB" // stock's, both paths
+	donutHPAmpJack    = "3" // stock's headphone path
+	donutHPAmpSpeaker = "0" // stock's speaker path, and what Init sets
 )
 
 // donutJackRouting is jackRouting for the Dot 3. The speaker is muted FIRST on
@@ -125,8 +133,6 @@ func donutJackRouting(inserted bool) []mixerWrite {
 	if inserted {
 		return []mixerWrite{
 			{Ctl: mixer.PlaybackVolume, Args: []string{"0"}},
-			{Ctl: ctlDonutHPGainL, Args: []string{donutHPGain}},
-			{Ctl: ctlDonutHPGainR, Args: []string{donutHPGain}},
 			{Ctl: ctlDonutHPAmp, Args: []string{donutHPAmpJack, donutHPAmpJack}},
 			{Ctl: ctlDonutLineOut, Args: []string{"OPEN"}},
 			{Ctl: ctlDonutHPOut, Args: []string{"AUDIO_AMP"}},
