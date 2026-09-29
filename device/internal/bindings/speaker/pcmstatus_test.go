@@ -86,12 +86,11 @@ func TestEachBoardOpensItsOwnSpeaker(t *testing.T) {
 		b      *board.Board
 		dev    int
 		unity  string
-		jack   bool
 		status string
 	}{
-		{nil, 23, "127", true, "/proc/asound/card0/pcm23p/sub0/status"},
-		{board.Biscuit, 23, "127", true, "/proc/asound/card0/pcm23p/sub0/status"},
-		{board.Donut, 6, "255", false, "/proc/asound/card0/pcm6p/sub0/status"},
+		{nil, 23, "127", "/proc/asound/card0/pcm23p/sub0/status"},
+		{board.Biscuit, 23, "127", "/proc/asound/card0/pcm23p/sub0/status"},
+		{board.Donut, 6, "255", "/proc/asound/card0/pcm6p/sub0/status"},
 	} {
 		id := board.IDOf(c.b)
 		if got := playbackDevice(c.b); got != c.dev {
@@ -102,9 +101,6 @@ func TestEachBoardOpensItsOwnSpeaker(t *testing.T) {
 		}
 		if got := unityVolume(c.b); got != c.unity {
 			t.Errorf("%s: unity volume %q, want %q", id, got, c.unity)
-		}
-		if got := jackRoutingApplies(c.b); got != c.jack {
-			t.Errorf("%s: jack routing %v, want %v", id, got, c.jack)
 		}
 	}
 }

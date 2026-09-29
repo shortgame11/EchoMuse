@@ -353,15 +353,12 @@ func waitForFreePcm(card, device int, timeout time.Duration) {
 //     until someone unplugged and replugged — which is exactly why replugging
 //     was the folk remedy. It manufactures the edge the boot never had.
 func (p *PcmSpeaker) SetJackRouting(inserted bool) {
-	if !jackRoutingApplies(board.Current()) {
-		return
-	}
 	p.jackMu.Lock()
 	p.jackInserted = inserted
 	p.jackKnown = true
 	p.jackMu.Unlock()
 
-	p.applyJackWrites(jackRouting(inserted))
+	p.applyJackWrites(jackRoutingFor(board.Current(), inserted))
 	log.Printf("[speaker] jack routing applied (%s)",
 		map[bool]string{true: "external", false: "internal"}[inserted])
 }
@@ -391,9 +388,6 @@ const JackReconcileInterval = 30 * time.Second
 // jack.Watch has run there is no desired state, and guessing one would fight
 // whatever Init established.
 func (p *PcmSpeaker) ReconcileJackRouting() int {
-	if !jackRoutingApplies(board.Current()) {
-		return 0
-	}
 	p.jackMu.Lock()
 	inserted, known := p.jackInserted, p.jackKnown
 	p.jackMu.Unlock()
@@ -401,14 +395,15 @@ func (p *PcmSpeaker) ReconcileJackRouting() int {
 		return 0
 	}
 
+	b := board.Current()
 	current := map[string]string{}
-	for _, ctl := range []string{ctlSpeakerAmp, ctlHPDriverGain} {
-		if v, err := mixer.Get(ctl); err == nil {
-			current[ctl] = v
+	for _, w := range jackRoutingFor(b, inserted) {
+		if v, err := mixer.Get(w.Ctl); err == nil {
+			current[w.Ctl] = v
 		} // a failed read is not evidence of drift
 	}
 
-	drift := jackRoutingDrift(inserted, current)
+	drift := jackRoutingDrift(b, inserted, current)
 	if len(drift) == 0 {
 		return 0
 	}

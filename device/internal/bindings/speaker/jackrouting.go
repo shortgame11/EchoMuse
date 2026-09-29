@@ -1,6 +1,9 @@
 package speaker
 
-import "github.com/wilbowes/EchoMuse/internal/bindings/mixer"
+import (
+	"github.com/wilbowes/EchoMuse/internal/bindings/mixer"
+	"github.com/wilbowes/EchoMuse/pkg/board"
+)
 
 // Jack routing: the codec state each plug position needs.
 //
@@ -82,6 +85,70 @@ func jackRouting(inserted bool) []mixerWrite {
 	}
 }
 
+// ── Echo Dot 3rd gen ─────────────────────────────────────────────────────────
+//
+// The jack is the MT8167 codec's headphone output, not the TAS2770 (which has
+// one output, the speaker) and not the tlv320aic3101 (microphone inputs only).
+// The codec is fed from DL1 through the INT ADDA link, which DonutRoutes
+// already connects, so the same stream reaches both outputs and choosing one is
+// three mixer writes.
+//
+// MEASURED 2026-09-29 on a Dot 3, EchoMuse stopped, by playing a tone with
+// tinyplay: stock's "normal-playback headphone" path from
+// /system/vendor/etc/mixer_paths.xml plays through the jack at a usable level.
+// Every earlier test read as a dead jack for one reason: the headphone amp
+// ("Audio Amp Playback Volume", 0..7) sat at 0 or 1, which is inaudible
+// through a powered speaker. Maximum gain is what first made it audible.
+//
+// The speaker is silenced the way stock does it, by the TAS2770's volume at 0
+// (it is inverted: 255 = 0dB, 0 = mute), not with "I2S O03_O04 Switch". That
+// switch is a DAPM path decided at stream open, and this firmware holds DL1
+// open for its whole life, so flipping it live changed nothing — measured.
+//
+// Stock's own "mixer" daemon notices the plug too (Enabling Lineout,
+// ChangeOutput: to primary hal: lineout) but switches nothing until it opens a
+// stream of its own, which it cannot while we hold DL1.
+const (
+	ctlDonutHPOut     = "HPOUT Mux"
+	ctlDonutLineOut   = "LINEOUT Mux"
+	ctlDonutHPAmp     = "Audio Amp Playback Volume"
+	ctlDonutHPGainL   = "Headset_PGAL_GAIN"
+	ctlDonutHPGainR   = "Headset_PGAR_GAIN"
+	donutHPAmpJack    = "3"    // stock's headphone path
+	donutHPAmpSpeaker = "0"    // stock's speaker path, and what Init sets
+	donutHPGain       = "-2dB" // stock's, both paths
+)
+
+// donutJackRouting is jackRouting for the Dot 3. The speaker is muted FIRST on
+// insert and unmuted LAST on removal, so neither edge plays both outputs.
+func donutJackRouting(inserted bool) []mixerWrite {
+	if inserted {
+		return []mixerWrite{
+			{Ctl: mixer.PlaybackVolume, Args: []string{"0"}},
+			{Ctl: ctlDonutHPGainL, Args: []string{donutHPGain}},
+			{Ctl: ctlDonutHPGainR, Args: []string{donutHPGain}},
+			{Ctl: ctlDonutHPAmp, Args: []string{donutHPAmpJack, donutHPAmpJack}},
+			{Ctl: ctlDonutLineOut, Args: []string{"OPEN"}},
+			{Ctl: ctlDonutHPOut, Args: []string{"AUDIO_AMP"}},
+		}
+	}
+	return []mixerWrite{
+		{Ctl: ctlDonutHPOut, Args: []string{"OPEN"}},
+		{Ctl: ctlDonutLineOut, Args: []string{"VOICE_AMP"}},
+		{Ctl: ctlDonutHPAmp, Args: []string{donutHPAmpSpeaker, donutHPAmpSpeaker}},
+		{Ctl: mixer.PlaybackVolume, Args: []string{unityVolume(board.Donut)}},
+	}
+}
+
+// jackRoutingFor is the routing table for a board. Anything not positively
+// the Dot 3 keeps biscuit's.
+func jackRoutingFor(b *board.Board, inserted bool) []mixerWrite {
+	if b == board.Donut {
+		return donutJackRouting(inserted)
+	}
+	return jackRouting(inserted)
+}
+
 // ── Drift ────────────────────────────────────────────────────────────────────
 //
 // Applying the routing once on a jack edge is not enough, and this is measured
@@ -105,9 +172,9 @@ func jackRouting(inserted bool) []mixerWrite {
 // read failed, and "failure to look is not evidence of absence" applies here
 // exactly as it does to the controller's asset reconcile — rewriting on a
 // failed read would rewrite it every interval forever.
-func jackRoutingDrift(inserted bool, current map[string]string) []mixerWrite {
+func jackRoutingDrift(b *board.Board, inserted bool, current map[string]string) []mixerWrite {
 	var out []mixerWrite
-	for _, w := range jackRouting(inserted) {
+	for _, w := range jackRoutingFor(b, inserted) {
 		got, ok := current[w.Ctl]
 		if !ok {
 			continue

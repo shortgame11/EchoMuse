@@ -1283,11 +1283,34 @@ left ~11ms of slack in stock's 1536-frame buffer);
 stock's routing (`Audio Amp Playback Volume` 0, `Headset_PGAL/R_GAIN` −2 dB,
 `LINEOUT Mux` `VOICE_AMP`) set **before** opening the stream; open only once
 `pcm1c` and `pcm7c` are `RUNNING`, which matches stock's order (it did not by
-itself fix anything; pin 57 did); no amp switch on or off (there is none);
-and the jack reconciler does nothing, since its two controls are biscuit's
-codec. Buttons: action and volume arrive on `event3`, mute on `event1`, and
+itself fix anything; pin 57 did); and no amp switch on or off (there is none). Buttons: action and volume arrive on `event3`, mute on `event1`, and
 Amazon's daemon is `acebuttond`; a key's meaning comes from its code, so the
 one read loop serves both layouts.
+
+**The jack is the MT8167 codec's headphone output** (`speaker/jackrouting.go`,
+`donutJackRouting`), found 2026-09-29. Plug detection is the same
+`/sys/class/switch/h2w` as biscuit, so the existing watcher and reconciler
+serve both boards from per-board tables. On insert: the TAS2770 volume to 0
+(stock's way of silencing the speaker), `Audio Amp Playback Volume` 3/3,
+`Headset_PGAL/R_GAIN` −2 dB, `LINEOUT Mux` OPEN, `HPOUT Mux` AUDIO_AMP; removal
+reverses it, with the speaker unmuted last. That is stock's
+`normal-playback headphone` path from `/system/vendor/etc/mixer_paths.xml`.
+
+It took a day because **a quiet jack reads as a dead one**. The headphone amp
+(0..7) sat at 0 or 1, inaudible through a powered speaker, so every correct
+routing change looked like it did nothing. The trail that followed was all
+real and all beside the point: the TAS2770 has one output and the
+tlv320aic3101 here has only inputs; Amazon's HAL carries `SetExtDacGpioEnable`
+and `MFP Gpio Mute`, generic MediaTek code with no pin on this board (no DAC
+pin in `/sys/kernel/debug/gpio`, and no pin moves on insert); stock's `mixer`
+daemon logs `Enabling Lineout` on insert but switches nothing until it opens
+its own stream. **Test an output at maximum gain before concluding it is
+dead.** Two traps: `I2S O03_O04 Switch` is decided at stream open, and this
+firmware never closes DL1, so it cannot mute the speaker live (the TAS2770
+volume can); and the DAPM tree under
+`/sys/kernel/debug/asoc/mt-snd-card/codec:mt8167-codec/dapm` shows every
+stage of the headphone path powered, which is how the gain was left as the
+only suspect.
 
 **Testing on this board:**
 
@@ -1326,7 +1349,8 @@ time here). WiFi has no framework in the loop once Alexa is off:
 `ifconfig wlan0 up`, and DHCP is a `dhcpcd` service.
 
 **Open on this board:** the mute-LED pin; the mic geometry; the idme device
-type id; line-out routing (the jack reconciler is off here); a thermal
+type id; whether the jack switch holds while stock's `mixer` daemon reacts to
+the plug (the reconciler would put back anything it moves); a thermal
 `Tuning` read off a stock Dot 3; `assetmgrd` still starts from an unidentified
 trigger; `start_server.sh` still writes biscuit's mixer controls and waits
 120 s for `echoaudio`; and `DL1_AWB_Record` could replace the software AEC tap

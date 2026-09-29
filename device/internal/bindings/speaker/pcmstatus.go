@@ -49,13 +49,6 @@ func unityVolume(b *board.Board) string {
 	return dacUnity
 }
 
-// jackRoutingApplies reports whether the jack reconciler has anything to do.
-// Its two controls (the internal amp switch and the HP driver gain) are
-// biscuit's codec; the Dot 3's card has neither, and its line-out routing has
-// not been measured, so there it does nothing rather than rewrite controls
-// that do not exist every 30s.
-func jackRoutingApplies(b *board.Board) bool { return b != board.Donut }
-
 // The playback substream's status file, which is how we find out whether
 // anyone else holds the speaker BEFORE trying to open it.
 //
