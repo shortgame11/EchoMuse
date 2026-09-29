@@ -1,6 +1,15 @@
 # EchoMuse
 
-**Turn an old Amazon Echo Dot (2nd gen) into a local voice assistant for Home Assistant.**
+**Turn an old Amazon Echo Dot (2nd or 3rd gen) into a local voice assistant for Home Assistant.**
+
+> **This is a fork of [wilbowes/EchoMuse](https://github.com/wilbowes/EchoMuse)
+> that adds the Echo Dot 3rd gen.** One firmware build serves both Dots and
+> picks the right hardware settings at startup. The Dot 3 support isn't in
+> the official releases or the official Home Assistant add-on yet, so a
+> Dot 3 needs the add-on and firmware built from this repository (see
+> [Echo Dot 3rd gen](#echo-dot-3rd-gen) below). With a Dot 2, use the
+> official project: this fork's firmware hasn't been tested on a Dot 2 yet.
+> Porting notes are on [issue #527](https://github.com/wilbowes/EchoMuse/issues/527).
 
 [![CI](https://github.com/wilbowes/EchoMuse/actions/workflows/ci.yml/badge.svg)](https://github.com/wilbowes/EchoMuse/actions/workflows/ci.yml)
 [![Firmware](https://img.shields.io/github/v/release/wilbowes/EchoMuse?filter=v*&label=firmware)](https://github.com/wilbowes/EchoMuse/releases)
@@ -25,8 +34,9 @@ install there.
 
 **What it is**
 
-- A replacement for the software on an **Echo Dot 2nd generation (2016)**. Its
-  microphones, speaker, LED ring and buttons all work.
+- A replacement for the software on an **Echo Dot 2nd generation (2016)** or
+  an **Echo Dot 3rd generation (2018)**. Their microphones, speaker, LED ring
+  and buttons all work.
 - A **controller** you run on your own network, as a Home Assistant add-on or
   a Docker container. It detects the wake word, manages your devices and has
   a web dashboard.
@@ -45,22 +55,25 @@ install there.
   a step goes wrong the Dot can end up soft-bricked, and the
   [XDA thread](https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-dot-2nd-gen-2016-biscuit.4761416/)
   covers recovering it.
-- **Not for other Echo models, yet.** Only the Echo Dot 2nd gen works today.
-  Ports to the Echo Dot 3, Echo 2 and Echo Show 8 are in progress with
-  community help.
+- **Not for other Echo models, yet.** The Echo Dot 2nd gen is the supported
+  device; the Echo Dot 3rd gen works with this fork. Ports to the Echo 2 and
+  Echo Show 8 are in progress with community help.
 - **Not affiliated with Amazon.**
 
 ## What you need
 
 | | |
 |---|---|
-| An Echo Dot 2nd gen | The hardware being repurposed. |
+| An Echo Dot 2nd gen, or a 3rd gen with this fork | The hardware being repurposed. |
 | Home Assistant | With a working Assist pipeline. |
 | An always-on computer | Runs the controller. The Home Assistant machine itself is fine if it runs add-ons. |
-| A Linux computer (a live USB works) and a micro-USB cable, once | To unlock the Dot. The unlock does not run on macOS. |
+| A Linux computer (a live USB works) and a USB cable, once | To unlock the Dot: micro-USB for a Dot 2, and the Dot 3 unlock thread lists what it needs. The Dot 2 unlock does not run on macOS. |
 | Chrome or Edge, once | The setup wizard talks to the Dot over USB from the browser. |
 
 ## Getting started
+
+These steps are for the **Echo Dot 2nd gen**. For a Dot 3, skip to
+[Echo Dot 3rd gen](#echo-dot-3rd-gen).
 
 1. **Unlock the Dot** with R0rt1z2's
    [amonet-biscuit](https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-dot-2nd-gen-2016-biscuit.4761416/).
@@ -96,6 +109,62 @@ The wizard offers two ways to run EchoMuse on the Dot:
 - **FireOS with root** keeps Amazon's Android 5 and runs EchoMuse on top. FireOS
   5 only. It is the older path, with the most hours behind it.
 
+The Dot 3 has neither choice: it stays on its own FireOS (see below).
+
+## Echo Dot 3rd gen
+
+The Dot 3 runs EchoMuse on top of its stock FireOS 6 (Android 7.1.2). Its
+bootloader still checks the boot image, so emOS can't boot on it; the wizard
+edits the system partition from TWRP instead, and every file it changes is
+backed up first.
+
+**Working, on one unit so far:** wake word, speaker, LED ring, buttons, the
+mute button and its LED, the ambient light sensor, the 3.5mm output (the
+speaker goes quiet when a plug is in), and WiFi, all surviving cold boots.
+
+**What you need, beyond the list above:**
+
+- A Dot 3 unlocked and rooted as described in the
+  [Echo Dot 3rd gen unlock thread](https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-dot-3rd-gen-2018-donut.4801400/):
+  amonet, TWRP 3.7.0, and `boot-root.zip` from the same thread. **At your own
+  risk**, as with the Dot 2.
+- A 32-bit ARM `busybox` binary. FireOS 6 has no busybox, and the controller
+  needs it to copy files to the Echo.
+- Docker, to build the firmware.
+
+**Steps:**
+
+1. **Build the controller add-on from this fork** and install it as a local
+   add-on:
+
+   ```bash
+   cd controller
+   tools/make_dev_addon.sh
+   ```
+
+   Copy the folder it makes to `/addons/` on your Home Assistant host (the
+   Samba share or the SSH add-on), then find it at the top of Settings →
+   Add-ons → Add-on Store. Docker users can build the controller image from
+   `controller/` instead.
+2. **Build the firmware:**
+
+   ```bash
+   git submodule update --init
+   cd device
+   docker build -t echomuse-compiler compiler/
+   ./compile.sh          # writes build/server
+   ```
+3. **Run the setup wizard** with the Dot 3 connected over USB. It recognises
+   the Dot 3, takes the Dot 3 path, and tells you when it needs the Echo in
+   TWRP. At Patch System it asks for
+   `boot-root.zip` and your busybox. At the install step choose **Install
+   Custom Build** and pick `build/server`, because the GitHub release doesn't
+   have the Dot 3 audio changes.
+
+Hardware details and everything learned along the way are in the Dot 3
+section of [`device/CLAUDE.md`](device/CLAUDE.md) and on
+[issue #527](https://github.com/wilbowes/EchoMuse/issues/527).
+
 ## Features
 
 - **Voice turns through Assist**, with the answer played on the Dot.
@@ -109,7 +178,8 @@ The wizard offers two ways to run EchoMuse on the Dot:
   stay quiet.
 - **Music:** each Dot is a Home Assistant media player (media browser, Music
   Assistant, radio). Speaking over music lowers it under the answer rather
-  than pausing it.
+  than pausing it. Plugging a speaker into the 3.5mm jack moves the sound
+  there.
 - **Timers and announcements** from Home Assistant.
 - **Custom wake words** you train yourself with [`oww_forge`](oww_forge/README.md)
   and install from the dashboard.
@@ -142,7 +212,9 @@ The wizard offers two ways to run EchoMuse on the Dot:
   how often it checks ([details](docs/configuration.md#what-leaves-your-network)).
 - **The mute button is a software mute.** It silences the microphones in the
   audio chip and EchoMuse refuses to listen while it is on, but the Dot 2 has
-  no hardware switch that disconnects them.
+  no hardware switch that disconnects them. On the Dot 3, Amazon's own
+  privacy driver handles the button and its LED; whether it also cuts the
+  microphones in hardware hasn't been checked.
 
 ## Status and known issues
 
@@ -156,6 +228,16 @@ knowing before you start:
   for it. Use WPA2 ([#536](https://github.com/wilbowes/EchoMuse/issues/536)).
 - An announcement during a ringing timer can't be heard
   ([#373](https://github.com/wilbowes/EchoMuse/issues/373)).
+
+On the Echo Dot 3rd gen:
+
+- It has run on one unit, and this fork's firmware hasn't yet been run on a
+  Dot 2.
+- After a crash or power cut, WiFi can fail to come up (orange ring, "interface
+  disabled") until it's brought up by hand. The boot script runs
+  `ifconfig wlan0 up` once, and should retry.
+- The positions of the four microphones haven't been measured, so the
+  direction shown on the LED ring may be wrong.
 
 Everything else is in the [issue tracker](https://github.com/wilbowes/EchoMuse/issues).
 
@@ -180,6 +262,7 @@ Everything else is in the [issue tracker](https://github.com/wilbowes/EchoMuse/i
 | [emOS](emos/README.md) | How our own userspace on the Dot works. |
 | [How the voice pipeline works](docs/voice-pipeline.md) | The path from wake word to answer. |
 | [Device ↔ controller protocol](docs/device-controller-interface.md) | For porting EchoMuse to new hardware. |
+| [Echo Dot 3rd gen notes](device/CLAUDE.md) | The Dot 3's hardware and what the firmware does differently on it (the Dot 3 section). |
 | [Contributing](CONTRIBUTING.md) | Building from source, tests, and how to send changes. |
 | [Engineering journal](JOURNAL.md) | How each part was worked out, including the dead ends. |
 
@@ -204,6 +287,9 @@ EchoMuse would not exist without:
   canceller), and **Nils L. Westhausen**, for [DTLN](https://github.com/breizhn/DTLN)
   (noise suppression).
 - **Home Assistant and ESPHome**, whose open voice stack EchoMuse plugs into.
+- The authors of the
+  [Echo Dot 3rd gen unlock](https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-dot-3rd-gen-2018-donut.4801400/),
+  which the Dot 3 support depends on.
 - Everyone who has [contributed code](https://github.com/wilbowes/EchoMuse/graphs/contributors),
   filed issues or tested on their own hardware.
 
