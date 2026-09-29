@@ -5,8 +5,9 @@
 > **This is a fork of [wilbowes/EchoMuse](https://github.com/wilbowes/EchoMuse)
 > that adds the Echo Dot 3rd gen.** One firmware build serves both Dots and
 > picks the right hardware settings at startup. The Dot 3 support isn't in
-> the official releases or the official Home Assistant add-on yet, so a
-> Dot 3 needs the add-on and firmware built from this repository (see
+> the official releases or the official Home Assistant add-on yet, and this
+> fork doesn't publish an add-on of its own. A Dot 3 therefore needs the
+> add-on and firmware built from this repository (see
 > [Echo Dot 3rd gen](#echo-dot-3rd-gen) below). With a Dot 2, use the
 > official project: this fork's firmware hasn't been tested on a Dot 2 yet.
 > Porting notes are on [issue #527](https://github.com/wilbowes/EchoMuse/issues/527).
@@ -80,7 +81,10 @@ These steps are for the **Echo Dot 2nd gen**. For a Dot 3, skip to
    Either version works: v1.1.0 leaves it on FireOS 5, v2.0.0 moves it to
    FireOS 6. The [rooting guide](docs/rooting.md) explains the choice. **You
    do this at your own risk.**
-2. **Start the controller**, as an add-on:
+2. **Start the controller**, as an add-on. This button and the Docker
+   commands below install **Will's official add-on**, which has no Dot 3
+   screens; for a Dot 3, build the add-on from this fork as described
+   [below](#echo-dot-3rd-gen).
 
    [![Add the EchoMuse repository to Home Assistant](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fwilbowes%2FEchoMuse)
 
