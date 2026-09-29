@@ -3,7 +3,7 @@
 **Turn an old Amazon Echo Dot (2nd or 3rd gen) into a local voice assistant for Home Assistant.**
 
 > **This is a fork of [wilbowes/EchoMuse](https://github.com/wilbowes/EchoMuse)
-> that adds the Echo Dot 3rd gen.** One firmware build serves both Dots and
+> that adds the Echo Dot 3rd (D9N29T) gen.** One firmware build serves both Dots and
 > picks the right hardware settings at startup. The Dot 3 support isn't in
 > the official releases or the official Home Assistant add-on yet, and this
 > fork doesn't publish an add-on of its own. A Dot 3 therefore needs the
