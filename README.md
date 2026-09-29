@@ -71,7 +71,7 @@ install there.
 | A Linux computer (a live USB works) and a USB cable, once | To unlock the Dot: micro-USB for a Dot 2, and the Dot 3 unlock thread lists what it needs. The Dot 2 unlock does not run on macOS. |
 | Chrome or Edge, once | The setup wizard talks to the Dot over USB from the browser. |
 
-## Getting started
+## Getting started (Dot 2)
 
 These steps are for the **Echo Dot 2nd gen**. For a Dot 3, skip to
 [Echo Dot 3rd gen](#echo-dot-3rd-gen).
