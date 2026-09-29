@@ -1225,8 +1225,11 @@ starved of valid clocks**, three different ways:
   reboot. Read it in `/sys/devices/platform/soc/1000b000.pinctrl/mt_gpio`:
   `57: 4 0 0 1 …` clean, `57: 0 1 0 0 …` after EchoMuse. `unexport` plus
   `echo 'mode 57 4'` into that file restores sound without a reboot. Fix:
-  `mute_button.go` does nothing on the Dot 3. **The Dot 3's real
-  mute-LED pin is not yet known**, so the LED is not driven. This is the
+  `mute_button.go` does nothing on the Dot 3. **It needs to do nothing**:
+  the mute LED works without us, driven by Amazon's privacy driver, which
+  holds the pin (`privacy_enable_gpio`, gpio 494, beside
+  `gpio-privacy-state` 495 in `/sys/kernel/debug/gpio`). Confirmed working
+  on hardware 2026-09-29. This is the
   biscuit lesson again, one board later: a GPIO number is a property of one
   board, and the write that is wrong on the next one succeeds silently.
 - **Volume is the amp's digital volume, inverted.** `PCM Playback Volume` is
@@ -1348,7 +1351,7 @@ time here). WiFi has no framework in the loop once Alexa is off:
 `wpa_supplicant` sits at `INTERFACE_DISABLED` until something runs
 `ifconfig wlan0 up`, and DHCP is a `dhcpcd` service.
 
-**Open on this board:** the mute-LED pin; the mic geometry; the idme device
+**Open on this board:** the mic geometry; the idme device
 type id; whether the jack switch holds while stock's `mixer` daemon reacts to
 the plug (the reconciler would put back anything it moves); a thermal
 `Tuning` read off a stock Dot 3; `assetmgrd` still starts from an unidentified
