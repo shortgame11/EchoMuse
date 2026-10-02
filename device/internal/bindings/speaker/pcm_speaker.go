@@ -185,7 +185,10 @@ func (p *PcmSpeaker) pullSource() []byte {
 	if box == nil || !box.s.Active() {
 		return nil
 	}
-	b, err := os.ReadFile(statusPath(cardNr, deviceNr))
+	// The board's own playback device: biscuit's 23 is absent on the Echo
+	// Dot 3 (DL1 is 6), so reading it failed every period and Sendspin
+	// played silence while its player looked healthy in Music Assistant.
+	b, err := os.ReadFile(statusPath(cardNr, playbackDevice(board.Current())))
 	now := time.Now()
 	if err != nil {
 		return nil

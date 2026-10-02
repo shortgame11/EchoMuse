@@ -1325,6 +1325,12 @@ volume can); and the DAPM tree under
 stage of the headphone path powered, which is how the gain was left as the
 only suspect.
 
+**Sendspin reads the board's own playback device.** Its pull source times
+each period from the speaker's status file, and it read biscuit's `pcm23p`
+by constant. On the Dot 3 that file does not exist, so every period returned
+silence while the player looked healthy in Music Assistant (2026-10-02). Any
+new reader of `/proc/asound/card0/pcm*` must go through `playbackDevice`.
+
 **Testing on this board:**
 
 - **Bisect only from clean boots.** The 16 kHz capture and the pin 57 export

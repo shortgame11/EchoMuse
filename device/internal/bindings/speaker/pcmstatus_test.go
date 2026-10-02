@@ -130,3 +130,17 @@ func TestEachBoardOpensItsOwnSpeaker(t *testing.T) {
 		}
 	}
 }
+
+// Sendspin times its audio from the speaker's status file, so it must read
+// the device this board actually plays on. Reading biscuit's pcm23p on the
+// Dot 3 found no file and played silence (2026-10-02).
+func TestSendspinReadsTheBoardsOwnStatusFile(t *testing.T) {
+	for b, want := range map[*board.Board]string{
+		board.Biscuit: "/proc/asound/card0/pcm23p/sub0/status",
+		board.Donut:   "/proc/asound/card0/pcm6p/sub0/status",
+	} {
+		if got := statusPath(cardNr, playbackDevice(b)); got != want {
+			t.Errorf("%s: %q, want %q", board.IDOf(b), got, want)
+		}
+	}
+}
