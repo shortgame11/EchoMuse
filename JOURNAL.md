@@ -4079,3 +4079,87 @@ to 2.3.5 like `requirements.txt`.
 **Open:** the mute-LED pin; the base64 decoder upstream; `assetmgrd`'s trigger;
 the jack reconciler on this board; and a board switch for the firmware changes,
 whose host tests still pin biscuit values.
+
+## 2026-09-30 (evening) — Sendspin heard on an Echo, and emOS's firewall found twice
+
+**Sendspin played on 15LE** (emOS 32-bit, PR #701 build, Music Assistant
+2.10.4): paired by token, and Wil confirmed play, ducking under a voice reply,
+seek, volume from both ends, pause/resume and discovery. Sync against a second
+player, the correction rate, CPU with on-device wake word, voice "stop" over
+music and a link drop are still to do.
+
+**The dev add-on had been building an hour-old backup.** A copy made before
+the update sat in `/addons` with the same slug, and Supervisor built from it:
+every rebuild "worked" and the dashboard had no Sendspin section. The only
+sign was `ha apps info` still reporting the old version, which had been
+written off as stale metadata. Backups now go outside `/addons`.
+
+**emOS drops inbound connections, and the player is the first listener.** It
+logged "listening on :8928" while every connection from Music Assistant timed
+out, and Music Assistant never listed the player — it looked like discovery
+failing. The interop harness runs the player in Docker and never met the
+filter. Fix (`internal/firewall`): the firmware inserts an ACCEPT for 8928
+before advertising and removes it on every stop, so an Echo with Sendspin off
+is still outbound-only. Verified after a clean reboot (the rule appeared, Music
+Assistant reconnected paired in the same second) and on disable (rule gone,
+port dead).
+
+While here: IPv6 was never filtered on emOS built beside FireOS 6 (no
+`ip6tables` on its system partition). Fixed separately, #702.
+
+## 2026-09-30 (night) — IPv6 was never filtered on emOS built beside FireOS 6
+
+init's firewall loop runs `iptables` and `ip6tables`, and FireOS 6's system
+partition has no `ip6tables`, so on 15LE the IPv6 half failed silently and
+wlan0 took inbound IPv6 unfiltered. C95 (FireOS 5 system) was filtered. Found
+while opening a port for the Sendspin player. init now switches IPv6 off
+wherever the IPv6 DROP policy is not in place; nothing uses IPv6 (the
+controller link and mDNS are IPv4, and grandcat/zeroconf fails only when both
+stacks are missing). Run by hand on 15LE: IPv6 gone, firmware re-found the
+controller over mDNS; on C95 the check keeps IPv6. Reaches devices with the
+next emOS release.
+
+## 2026-10-01 — Sendspin on two Echoes: sync, stereo and the link drop
+
+**15LE (emOS 32-bit) and C95 (emOS 64-bit), grouped in Music Assistant, both
+with the on-device wake word.** C95 got the same build in its spare slot and
+was re-paired to the dev add-on. In sync by ear with one Echo at each ear;
+self-reported sync error 0.1–0.4ms, no underruns or late drops, ~9s buffered.
+
+**Nothing showed the correction rate, so the firmware now logs it.** The
+player's counts reached only the dashboard's live event stream — not shown,
+not logged, not in the support bundle. `[sendspin] playing:` once a minute
+while active (84184aa). Corrections settle at 2–7 a minute on both; 15LE ran
+~300 a minute for two minutes after a restart and again for one minute later
+on, then settled each time.
+
+**The `[mic] clock` skew is not a drift gauge over minutes.** It moves in
+~145ms steps (the 160ms capture batches), so a few minutes of it read as
+"650 ppm fast" on 15LE when nothing of the kind was happening.
+
+**CPU: playback costs less than the measurement resolves.** /proc ticks over
+10s, playing against paused: C95 62% vs 64% of one core, 15LE 37% vs 38%.
+15LE's figure is the on-device wake word (37.7% measured on VVV). C95's extra
+~25 points is unexplained — same firmware, same 1.3GHz, two cores online,
+both scanning BLE; the one known difference is the 64-bit kernel running
+32-bit code. Not Sendspin, not chased.
+
+**Link drop: stopping the dev add-on stopped both players in the same
+second**, port 8928 closed, nothing redialled; both were back ~20s after the
+add-on started, and Music Assistant restarted playback itself. A firmware
+swap mid-song did the same in ~2s.
+
+**A stereo pair needs nothing from us.** Set one Echo to left and one to
+right in Music Assistant: it picks each player's channel before encoding, so
+the mono-only player receives its own side (left/right test track, by ear).
+#274 is done by #701.
+
+**Still open:** an occasional faint crackle, possibly the speaker. A
+correction is a hard splice (≤8 frames dropped or one sample held), so the
+test is a sine captured off ch8 against the corrections — #707, with a
+crossfade as the fix if it is them. The line-out jack's silent channel (#669)
+and real stereo over the jack (#273) are separate.
+
+Also today: PR #696's wake-sample capture stores the previous session's tail
+as "wake" audio under private listening (its pre-roll is fed only by session
+frames) — changes requested.

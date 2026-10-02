@@ -298,7 +298,12 @@ func main() {
 		defer t.Stop()
 		duty := bluetooth.NewMusicDuty()
 		for now := range t.C {
-			music := duty.Yield(now, pcmSpeaker.MusicArriving(), pcmSpeaker.MusicLead())
+			// Synced music (Sendspin) is music too: it streams for hours
+			// and has its own buffer, so it gets the same bursts.
+			ssOn, ssLead := sendspinMusic()
+			music := duty.Yield(now, pcmSpeaker.MusicArriving() || ssOn,
+				max(pcmSpeaker.MusicLead(), ssLead))
+			sendspinPoll(pcmSpeaker)
 			bleScanner.Yield(music ||
 				dataClient.TurnStreamActive() ||
 				dataClient.ListenOpen() ||
@@ -422,6 +427,7 @@ func main() {
 		// buttons go inert. Set BEFORE the pulse starts, or its first frames
 		// are swallowed by the mute suppression on a muted device.
 		s.SetLinkDown(true)
+		sendspinLinkDown(pcmSpeaker)
 		go pulseOrange(pulseCtx, s)
 	})
 
@@ -440,6 +446,7 @@ func main() {
 		// nothing above this device, so the white pulse owns the ring and the
 		// buttons do nothing.
 		s.SetLinkDown(true)
+		sendspinLinkDown(pcmSpeaker)
 		go pulseWhite(pulseCtx, s)
 	})
 
@@ -459,6 +466,7 @@ func main() {
 		pulseCancel = cancel
 		pulseKind = "refused"
 		s.SetLinkDown(true)
+		sendspinLinkDown(pcmSpeaker)
 		go pulseRefused(pulseCtx, s)
 	})
 
@@ -508,6 +516,7 @@ func main() {
 			st.Ble = bleScanner.Stats()
 			st.OwwShadow = shadowStats(dataClient)
 			st.AecRef = canceller.RefSource()
+			st.Sendspin = sendspinStatus()
 			controlClient.SendStats(st)
 		}()
 		// Deliver any unacknowledged WiFi change outcome (including the
@@ -539,6 +548,7 @@ func main() {
 		}
 		applyAecConfig(canceller, dataClient)
 		applyBleConfig(bleScanner)
+		applySendspinConfig(pcmSpeaker, controlClient, s, deviceID)
 		applyShadowConfig(dataClient, controlClient, pcmSpeaker, s)
 		syncListenState(dataClient, controlClient, false)
 	})
@@ -553,6 +563,8 @@ func main() {
 		}
 		playWakeCue(pcmSpeaker)
 	})
+
+	controlClient.OnSendspinToken(sendspinToken)
 
 	// Speaker flush — barge-in: cut buffered TTS the moment the controller
 	// hears the wake word during playback.
@@ -680,6 +692,7 @@ func main() {
 	// Fires on every Set() call: physical button press or future volume_set command.
 	s.SetVolumeChangeCallback(func(level int) {
 		controlClient.SendVolumeState(level)
+		sendspinVolumeChanged(level)
 	})
 
 	// Volume set from controller (HA MediaPlayerCommandRequest forwarded down).
@@ -754,6 +767,7 @@ func main() {
 				snaps = append(snaps, sn)
 			}
 			st.TcpUpRetrans, st.TcpUpSegs = upLoss.Drain(snaps...)
+			st.Sendspin = sendspinStatus()
 			controlClient.SendStats(st)
 			if tick%10 == 0 {
 				var ms runtime.MemStats
@@ -788,6 +802,11 @@ func main() {
 	sig := <-sigCh
 	log.Printf("Received %v — shutting down (muting output, amp off)", sig)
 	bleScanner.SetEnabled(false) // scan off + /dev/stpbt closed so the chip idles
+	// "restart", not "shutdown": this is an OTA or a supervisor restart far
+	// more often than a power-off, and restart asks the server to redial.
+	if c := sendspinPlayer(); c != nil {
+		c.Stop("restart")
+	}
 	pcmSpeaker.Close()
 	os.Exit(0)
 }
@@ -823,6 +842,16 @@ func shadowStats(dc *client.DataClient) interface{} {
 	}
 }
 
+// emmcForStats is the eMMC wear for the stats tick, read at most every six
+// hours. An untyped nil when unreadable, so the field is null rather than a
+// typed nil the controller would have to tell apart.
+func emmcForStats() interface{} {
+	if e := platform.EmmcCached(6 * time.Hour); e != nil {
+		return e
+	}
+	return nil
+}
+
 func collectStats() client.DeviceStats {
 	cpuPct := cpuPercent()
 	memUsed, memTotal := memStats()
@@ -853,6 +882,7 @@ func collectStats() client.DeviceStats {
 		TxErrors:         txErr,
 		TxDropped:        txDrop,
 		RxCrcErrors:      rxCrc,
+		Emmc:             emmcForStats(),
 	}
 }
 

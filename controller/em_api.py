@@ -32,6 +32,7 @@ state with persisted DB state without coupling to a global.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import html as _html
 import json
@@ -55,6 +56,7 @@ from aiohttp import web
 import websockets
 
 import em_db as db
+import em_health
 import em_auth as auth
 import em_ble_proxy
 import em_broadcast
@@ -395,6 +397,7 @@ async def create_app() -> web.Application:
     app.router.add_delete("/api/devices/{id}",            _delete_device)
     app.router.add_post("/api/devices/{id}/approve",      _post_approve)
     app.router.add_get("/api/devices/{id}/config",        _get_device_config)
+    app.router.add_get("/api/devices/{id}/sendspin/token", _get_sendspin_token)
     app.router.add_post("/api/devices/{id}/config",       _post_device_config)
     app.router.add_get("/api/devices/{id}/logs",          _get_device_logs)
     app.router.add_get("/api/devices/{id}/turns",         _get_device_turns)
@@ -750,7 +753,8 @@ async def _get_devices(request: web.Request) -> web.Response:
     """GET /api/devices — all devices, live state merged with DB."""
     loop = asyncio.get_event_loop()
     rows = await loop.run_in_executor(None, db.get_all_devices)
-    return _ok([_merge_device(row) for row in rows])
+    health = await loop.run_in_executor(None, db.latest_health)
+    return _ok([_merge_device(row, health.get(row["device_id"])) for row in rows])
 
 
 @auth.require_auth
@@ -1038,7 +1042,49 @@ async def _patch_device(request: web.Request) -> web.Response:
     await loop.run_in_executor(None, db.set_device_label, device_id, label)
     await _push_event({"type": "device_update", "device_id": device_id,
                        "state": {"label": label}})
+    # Music Assistant lists the Sendspin player by this name; the device
+    # restarts the player to re-advertise it.
+    live = _devices.get(device_id)
+    if live is not None and getattr(live, "sendspin_capable", False):
+        with contextlib.suppress(Exception):
+            await live.send_control({"type": "config", "sendspinName": label})
     return _ok({"device_id": device_id, "label": label})
+
+
+# How long to wait for a device to answer sendspin_token_request. It is a
+# file read and one message on the control plane; seconds of slack are for
+# this fleet's link stalls, not for the work.
+SENDSPIN_TOKEN_TIMEOUT_S = 8
+
+
+@auth.require_admin
+async def _get_sendspin_token(request: web.Request) -> web.Response:
+    """GET /api/devices/{id}/sendspin/token — the pairing token to paste
+    into Music Assistant.
+
+    Asked of the device each time and never stored or logged: it carries the
+    device's pairing key, and anyone holding it can pair with the device.
+    Admin only for the same reason.
+    """
+    device_id = request.match_info["id"]
+    live = _devices.get(device_id)
+    if live is None:
+        return _error("device_offline", "The Echo is offline", 409)
+    if not getattr(live, "sendspin_capable", False):
+        return _error("unsupported", "This Echo's firmware has no Sendspin player", 409)
+    waiter = asyncio.get_event_loop().create_future()
+    live.sendspin_token_waiter = waiter
+    try:
+        await live.send_control({"type": "sendspin_token_request"})
+        reply = await asyncio.wait_for(waiter, SENDSPIN_TOKEN_TIMEOUT_S)
+    except (asyncio.TimeoutError, Exception):
+        return _error("timeout", "The Echo did not answer", 504)
+    finally:
+        if live.sendspin_token_waiter is waiter:
+            live.sendspin_token_waiter = None
+    if reply.get("error") or not reply.get("token"):
+        return _error("sendspin_off", "Turn Sendspin on for this Echo first", 409)
+    return _ok({"token": reply["token"], "clientId": reply.get("clientId")})
 
 
 @auth.require_admin
@@ -5540,6 +5586,7 @@ async def _get_support_bundle(request: web.Request) -> web.Response:
     turns, metrics, counters = [], [], []
     device_configs, live_state, logs = {}, {}, []
 
+    health = await loop.run_in_executor(None, db.latest_health)
     for row in rows:
         did = row["device_id"]
         device_configs[did] = await loop.run_in_executor(
@@ -5563,6 +5610,9 @@ async def _get_support_bundle(request: web.Request) -> web.Response:
             "volume":       getattr(live, "volume", None) if live else None,
             "media_state":  em_player.state(did),
             "stats":        em_support.redact_stats(live.stats if live else None),
+            # Latest boot's reason and eMMC wear (schema v28): hardware
+            # facts, nothing about the owner.
+            "boot":         em_support.redact_boot(health.get(did)),
         }
         turns += await loop.run_in_executor(None, db.get_turns, did, 50, since)
         # get_device_metrics resolves its own rows and does NOT carry the
@@ -5945,7 +5995,19 @@ def clear_link_refused(device_id: str) -> None:
     _link_refusals.pop(device_id, None)
 
 
-def _merge_device(row) -> dict:
+def _health_json(boot: dict | None) -> dict | None:
+    if not boot:
+        return None
+    return {
+        "emmc":       em_health.emmc_summary(boot),
+        "bootReason": em_health.boot_summary(boot.get("boot_reason")),
+        "bootAt":     boot.get("boot_at"),
+        "wearDay":    boot.get("day"),
+        "emmcPart":   " ".join(x for x in (boot.get("emmc_name"), boot.get("emmc_date")) if x) or None,
+    }
+
+
+def _merge_device(row, boot: dict | None = None) -> dict:
     """
     Merge a DB device row with live in-memory state.
 
@@ -6050,6 +6112,10 @@ def _merge_device(row) -> dict:
         "owwLocalCapable": getattr(live, "oww_local_capable", False) if live else False,
         "listen":          _listen_json(live) if live else None,
         "wakeCueCapable": getattr(live, "wake_cue_capable", False) if live else False,
+        # Sendspin player (#89): whether the firmware has one, and its status
+        # (no secrets; the pairing token is its own request).
+        "sendspinCapable": getattr(live, "sendspin_capable", False) if live else False,
+        "sendspin":        getattr(live, "sendspin", None) if live else None,
         "audioMixCapable": getattr(live, "audio_mix_capable", False) if live else False,
         # Gates the AEC delay slider, which only means anything on the
         # software tap. Paired with aecRef because the capability says the
@@ -6072,6 +6138,10 @@ def _merge_device(row) -> dict:
                            or row["kernel_arch"],
         "kernelRelease":   (getattr(live, "kernel_release", None) if live else None)
                            or row["kernel_release"],
+        # Flash wear and how the current boot started (schema v28, em_health):
+        # the stored last boot, so it survives the device going offline. Null
+        # from firmware that does not report them.
+        "health":          _health_json(boot),
         # The DERIVED answer, not a second copy of the rule. em_platform owns
         # "which payloads mean anything here"; a dashboard that re-derived it
         # from baseOs would be a mirror free to disagree with the server that

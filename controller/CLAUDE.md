@@ -908,6 +908,35 @@ with no way for the user to tell which they had.
     **`DATA_RECONNECT_GRACE_S`** (3s) rides out a brief data-plane drop instead of discarding the rest of the audio (#28). The budget is per STREAM, armed by `begin_data_stream()` and spent down by `send_data` — **never per frame**: `send_data` runs once per audio period, so a per-frame wait makes a genuinely-gone device stall every remaining frame in turn, draining a stream for hours while holding the voice lock.
 4. **Speaker** — the wire carries **mono** 48kHz; `_fetch_tts_audio` decodes at the wire rate (the satellite declares `supported_formats` 48k/mono/FLAC so HA transcodes at source when it can; ffmpeg resamples otherwise — no numpy resample step anymore). The device duplicates L=R at the ALSA write (stereo ALSA config is an I2S/codec constraint, not a wire one). Device buffers ~5.5s (`audioChanDepth`) and holds playback until ~1s is queued or EOS arrives (`primePeriods`) — WiFi-stall protection for marginal links
 
+## Sendspin: the music plane's second producer never crosses the controller
+
+Music Assistant connects to the Echo's Sendspin player directly (#89,
+`device/internal/sendspin`, design in `docs/audio-states.md` §6). The
+controller's whole part is four things, and none of them is audio:
+
+- **Config**: `sendspinEnabled` / `sendspinUnpaired` in their own `sendspin`
+  section, both default off; `sendspinName` is the device LABEL, added to the
+  registration push and sent alone by `_patch_device` on a rename, never stored.
+- **Status**: `sendspin_status` on change and `sendspin` on the stats tick,
+  held as `Device.sendspin` and surfaced in `/api/devices`.
+- **The pairing token** is fetched from the device per request
+  (`GET /api/devices/{id}/sendspin/token`, admin) and handed to that one
+  request. **Never log it, store it or put it in an event**: it carries the
+  device's pairing key, and events reach every open tab and support bundles.
+  `test_capabilities.py` pins that the handler does nothing else with it.
+- **Ducking needs nothing new.** `interrupt()` sends `duck on` on every turn to
+  an `audio_mix` device whether or not the controller thinks music is playing,
+  so synced music is ducked like `0x04` music. HA's own music still wins the
+  plane; that rule is enforced on the device.
+
+Volume is unified on the device (a server's volume IS the Echo's volume, and
+flows back to HA through the ordinary `volume_state`), and the player runs
+only while the controller link is up — both decided 2026-09-30.
+
+The output chain covers synced music only on the device path: behind a
+controller that does not announce `output_chain`, Sendspin audio is unshaped,
+because it never reaches this process.
+
 ## Timers, and owners are COUNTED not flagged
 
 Voice-assistant timers (#167, @bluescreen10) make the alarm ring a **fourth
@@ -916,7 +945,11 @@ holds the matchers and constants; `start_timer_alarm` / `stop_timer_alarm` /
 `_ring_timer_alarm` in `em_controller.py` drive it. Bursts are gated on
 `device.speaker_busy`, dismissal sends `speaker_flush` (or the ring plays out of
 ~5.5s of device buffer after it has been stopped), and an unanswered ring stops
-at `MAX_RING_S` = 120s.
+at `MAX_RING_S` = 15 minutes, Voice PE's cap. It was 120s until 2026-09-29:
+a timer rings for as long as it needs to, and one that stops early can be
+missed (Wil, declining #667's shorter setting). A longer ring leaves #373's
+announcement collision open for longer, which is one more reason that fix is
+owed.
 
 **The ring asks before writing the plane; the announcement does not, and that
 is #373.** `_ring_timer_alarm` gates every burst on `speaker_busy` because two
@@ -945,7 +978,7 @@ rather than yielding. An alarm-specific duck depth is wanted rather than
 borrowing `duckDb`, which was tuned for a music bed under speech.
 
 **Do not "fix" the announcement by blocking it for the whole ring** — HA blocks
-on the announce call holding `_is_announcing`, and a 120s `MAX_RING_S` would
+on the announce call holding `_is_announcing`, and a 15-minute `MAX_RING_S` would
 fail every other announcement to that satellite. Waiting for the BURST in
 flight is a different thing: the chime is 1.68s of every 2.3s, and real
 responses measure 1.6–2.6s of audio, so a capped wait is seconds rather than
@@ -1052,6 +1085,7 @@ single written ladder. `docs/audio-states.md` §2 is the nearest thing.
 | `em_endpoints.py` | The fleet's controller address list (`controllerEndpoints`, fleet-only via `em_config_sections.FLEET_KEYS`): validation to what a device can dial (IP literals, RFC 1123 names, ports) and the `controller.json` #166's firmware reads. Delivered as a FILE over the shell plane on save (one retry at 30s) and on connect, and by the wizard over adb. **Two removal rules on purpose**: the fleet sync removes only a file carrying `managed_by`, so hand-written files survive an upgrade; the wizard removes any file, because at provisioning this controller is the source of truth (Wil, 2026-09-24). mDNS fallback always on |
 | `em_wifi.py` | What a WiFi network may be called (0–32 arbitrary bytes, `ssid_hex` on the wire) and what its WPA2 passphrase may be. Mirrors `device/internal/wifi/ssid.go` and the dashboard's `_ssidProblem`/`_pskProblem`; `_post_device_wifi` checks with it so a bad request fails before a device-side switch and rollback |
 | `em_tcp.py` | The device link at the TCP layer: thin-stream retransmission on every accepted device socket (`tune`), `TCP_INFO` reads for downlink loss (`read_info`, `LossWindow`), and the per-minute grade behind the Status tab's Link tile (`MinuteStrip`, `verdict`). Tested against real sockets |
+| `em_health.py` | Boot-time health from the register message as dashboard lines: eMMC wear (EXT_CSD life-time and pre-EOL, worse of the two estimates; below rev 7 the bytes are not health) and boot reason (watchdog/panic = warning). Schema v28: `device_boots`, one row per kernel `boot_id` for the reason; `device_wear`, one row per device per day (latest reading wins, written on change) from the register message and the stats tick, so a device that never reboots still builds a history. Pure, tested from the spec's edges |
 | `em_dbwriter.py` | One worker thread for database writes nothing reads back, in submission order. **No coroutine in `em_controller` calls `db.*` directly** (`tests/test_db_off_loop.py`, by AST): writes go through `em_dbwriter.submit`, reads through `run_in_executor`. A synchronous write held the loop for the commit plus any wait on `_db_lock`, which executor threads share — measured 2026-09-26 at 114ms p99 / 122ms max loop lateness with a 20,000-turn activity read holding the lock, against 18ms / 42ms queued. `submit` never raises, which also fixed a delete bug: the disconnect path's `log_device` hit `FOREIGN KEY constraint failed` for the device just deleted, inside `handle_control`'s `finally`, and skipped the `_devices.pop` and service release after it with nothing logged |
 | `em_tasks.py` | `spawn` for background tasks nothing awaits: held in a set until done, exception logged when it happens. **No `asyncio.create_task` result is discarded** in em_api/em_controller/em_esphome, and every task wrapping an `Event.wait()` is torn down in a `finally` of the function that made it (`tests/test_tasks.py`, by AST). The second rule is the one that bit: `_run_post_turn_playback` cancelled its helpers at the end of its `try`, so a cancelled playback left two `Event.wait()` tasks pending — "Task was destroyed but it is pending!" on the dev add-on 2026-09-25, reproduced against 2.23.0 |
 | `em_linkauth.py` | The device-link auth decision as a pure function. Split out of `em_controller._link_auth_ok` so it is testable: the suite does not import em_controller, so this was security logic with no coverage until it orphaned a device |

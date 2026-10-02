@@ -196,6 +196,12 @@ function uptime(s) {
   return `${m}m`;
 }
 
+// A health level from the controller (ok / warn / error) as a row colour.
+function _levelColor(level) {
+  return level === 'error' ? 'var(--error)' : level === 'warn' ? 'var(--warn)'
+       : level === 'ok' ? 'var(--ok)' : undefined;
+}
+
 function relTime(ts) {
   if (!ts) return '—';
   const d = Date.now() - ts * 1000;
@@ -2094,6 +2100,18 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                              : '—',
                          device.connected ? (device.linkTls ? 'var(--ok)' : 'var(--warn)')
                            : device.linkRefused ? 'var(--error)' : undefined)}
+                    {/* The eMMC's own wear report and how the current boot
+                        started (schema v28). A watchdog or panic boot is the
+                        sign of a hang nobody saw. Both are absent on firmware
+                        that does not report them, and say so. */}
+                    {row('Flash wear', device.health?.emmc
+                           ? <span title={device.health.emmcPart || undefined}>{device.health.emmc.text}</span>
+                           : '—',
+                         _levelColor(device.health?.emmc?.level))}
+                    {row('Last boot', device.health?.bootAt
+                           ? [device.health.bootReason?.text, relTime(device.health.bootAt)].filter(Boolean).join(' · ')
+                           : '—',
+                         _levelColor(device.health?.bootReason?.level))}
                     {row('Config', (() => {
                       const n = (device.config_sections ?? []).length;
                       const total = Object.keys(CONFIG_SECTIONS).length;
@@ -2290,6 +2308,10 @@ function Detail({ device, token, onClose, onApprove, isAdmin, globalConfig, onDe
                 localCapable={!device.connected || !!device.owwLocalCapable}
                 listen={device.connected ? device.listen : null}
                 wakeCueCapable={!device.connected || !!device.wakeCueCapable}
+                sendspinCapable={!device.connected || !!device.sendspinCapable}
+                sendspinPanel={device.connected && device.sendspinCapable
+                  ? <SendspinPairing deviceId={device.device_id} status={device.sendspin} isAdmin={isAdmin}/>
+                  : null}
                 mixCapable={!device.connected || !!device.audioMixCapable}
                 holdCapable={!device.connected || !!device.buttonHoldCapable}
                 hwEchoRef={device.connected && device.aecRef === 'hw'}
@@ -2713,12 +2735,19 @@ function Card({ device, onClick }) {
         <LedRing state={state} size={120}/>
       </div>
       <div style={{ padding: '0 16px 16px' }}>
-        <div className="em-inset" style={{ '--em-inset-radius':'6px', '--em-inset-pad':'7px 12px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: state.lcd, letterSpacing: '0.12em', textShadow: `0 0 8px ${state.dot}88` }}>{state.label.toUpperCase()}</span>
-          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--lcd-dim)', letterSpacing: '0.08em' }}>{(() => {
+        {/* At the 190px minimum card width a long state (OFFLINE, LISTENING)
+            and a full IP do not fit on one line, and wrapping only when they
+            collide left cards in one row with footers of different heights.
+            So the IP always has its own line. */}
+        <div className="em-inset" style={{ '--em-inset-radius':'6px', '--em-inset-pad':'7px 12px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 3 }}>
+          <span style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: state.lcd, letterSpacing: '0.12em', textShadow: `0 0 8px ${state.dot}88`, whiteSpace: 'nowrap' }}>{state.label.toUpperCase()}</span>
+          {(() => {
             const ip = device.ip && device.ip !== '127.0.0.1' ? device.ip : null;
-            return device.connected ? (ip || '—') : (ip ? `${ip} ↑` : '—');
-          })()}</span>
+            return (
+              <span title={!device.connected && ip ? 'Last known address' : undefined}
+                    style={{ fontFamily: "'DM Mono',monospace", fontSize: 9, color: 'var(--lcd-dim)', letterSpacing: '0.08em', whiteSpace: 'nowrap' }}>{ip || '—'}</span>
+            );
+          })()}
         </div>
       </div>
     </div>
@@ -7732,6 +7761,28 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
   // Returns 0 when the header does not parse or the arithmetic lands outside the
   // buffer, meaning "send the whole thing" — a size optimisation must never be
   // the reason a build cannot happen.
+  // fetch() with a deadline covering the whole exchange, body included. Rejects
+  // with name 'TimeoutError' when it passes.
+  async function fetchWithDeadline(url, options, ms) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), ms);
+    try {
+      const resp = await fetch(url, { ...options, signal: ctl.signal });
+      const body = await resp.arrayBuffer();
+      return new Response(body, { status: resp.status, statusText: resp.statusText,
+                                  headers: resp.headers });
+    } catch (e) {
+      if (ctl.signal.aborted) {
+        const err = new Error(`no answer within ${Math.round(ms / 1000)}s`);
+        err.name = 'TimeoutError';
+        throw err;
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   function _bootImageLength(bytes) {
     if (!bytes || bytes.length < 2048) return 0;
     if (new TextDecoder().decode(bytes.slice(0, 8)) !== 'ANDROID!') return 0;
@@ -7747,6 +7798,12 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
 
   // Step 5 — build. The controller does the packing; see em_emos_build.py for
   // why it is there and not here.
+
+  // The build POST had no deadline, so a request that never came back (#689)
+  // left the step spinning with nothing to say where it stopped. The
+  // controller's own worst case is ~130s (release lookup 10s, payload download
+  // 120s), plus the 9MB upload on a slow link.
+  const EMOS_BUILD_DEADLINE_MS = 5 * 60 * 1000;
   async function runBuildEmos(useLatest) {
     if (!emosRef) {
       throw new Error('No escrowed boot image — run the Escrow Boot Image step first.');
@@ -7836,11 +7893,27 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     if (emosPlan && emosPlan.ok && emosPlan.systemPart) {
       fd.append('system_part', String(emosPlan.systemPart));
     }
-    const resp = await fetch(ingressPath('/api/provision/emos_image'), {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}` },
-      body: fd,
-    });
+    const started = Date.now();
+    const ticker = setInterval(() => {
+      addLog(`  still waiting for the controller (${Math.round((Date.now() - started) / 1000)}s)…`);
+    }, 30000);
+    let resp;
+    try {
+      resp = await fetchWithDeadline(ingressPath('/api/provision/emos_image'), {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        body: fd,
+      }, EMOS_BUILD_DEADLINE_MS);
+    } catch (e) {
+      if (e.name === 'TimeoutError') {
+        throw new Error('The controller did not answer within 5 minutes. Nothing has '
+          + 'been written to the Echo. Its log shows whether the image arrived: look '
+          + 'for "emOS image" or "Fetching binary".');
+      }
+      throw e;
+    } finally {
+      clearInterval(ticker);
+    }
     if (!resp.ok) {
       // The build refuses rather than warns, and every refusal names something
       // the operator can act on — surface it rather than the status code.
@@ -9708,14 +9781,15 @@ const CONFIG_SECTIONS = {
   "microphones": ["adcMicpga", "adcDigitalGain", "micGainDb", "beamformingEnabled", "beamAngle", "aecEnabled", "aecDelayMs", "aecTailMs", "aecRefSource", "nsAsr", "saveUtterances"],
   "ring": ["ledScene", "ledListenColor", "ledThinkColor", "meterAttack", "meterDecay", "meterFloor", "meterGamma", "meterRef", "meterCurve"],
   "advanced": ["agcEnabled", "vadThreshold", "vadSpeechMs", "vadSilenceMs", "buttonSingleTapEvent", "buttonMultiTapMs", "consolePassword", "consoleTimeoutMin", "controllerEndpoints"],
-  "bluetooth": ["bleProxyEnabled"]
+  "bluetooth": ["bleProxyEnabled"],
+  "sendspin": ["sendspinEnabled", "sendspinUnpaired"]
 };
 
 // Display labels for the section ids, and the reverse key -> section index
 // that lets a write be gated by the section owning the key it touches.
 const SECTION_LABELS = {
   playback: 'Playback', wakeword: 'Wake word', microphones: 'Microphones',
-  ring: 'Ring', advanced: 'Advanced', bluetooth: 'Bluetooth',
+  ring: 'Ring', advanced: 'Advanced', bluetooth: 'Bluetooth', sendspin: 'Sendspin',
 };
 const KEY_SECTION = {};
 Object.entries(CONFIG_SECTIONS).forEach(([sid, keys]) => {
@@ -9863,7 +9937,8 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                             holdCapable = true, triggerCapable = true,
                             localCapable = true, listen = null,
                             hwEchoRef = false, hwRefCapable = true,
-                            emosFleet = true, wakeCueCapable = true }) {
+                            emosFleet = true, wakeCueCapable = true,
+                            sendspinCapable = true, sendspinPanel = null }) {
   // emosFleet defaults TRUE for the same reason the capability props above do,
   // and for one more: it gates the console password, which is emOS-only, and
   // disabling a setting because we do not KNOW the fleet has an emOS device
@@ -10516,6 +10591,86 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
           <Toggle label="Bluetooth proxy" sub="passive BLE scan → HA (Bermuda, BLE sensors)" value={config.bleProxyEnabled ?? false} onChange={v => set('bleProxyEnabled', v)}/>
         </div>
       </Stage>
+
+      {/* 07 SENDSPIN */}
+      <Stage n="07" title="Sendspin"
+        chips={<ScopeChip tone="device">Device</ScopeChip>}
+        desc="Makes the Echo a Sendspin player, so Music Assistant can group it with other speakers and play to all of them in sync. Music Assistant connects to the Echo directly. Music from Home Assistant still takes priority and leaves the group. Early Access."
+        scope={scopeEl('sendspin')} dim={secStyle('sendspin')}>
+        <div className="em-grid2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 24px', ...inputStyle }}>
+          <Toggle label="Sendspin player"
+            sub={sendspinCapable ? 'Music Assistant finds it on the network' : 'needs newer firmware on this Echo'}
+            disabled={!sendspinCapable}
+            value={config.sendspinEnabled ?? false}
+            onChange={v => set('sendspinEnabled', v)}/>
+          <Toggle label="Play without pairing"
+            sub="any server Music Assistant approves; less secure"
+            disabled={!sendspinCapable || !(config.sendspinEnabled ?? false)}
+            value={config.sendspinUnpaired ?? false}
+            onChange={v => set('sendspinUnpaired', v)}/>
+        </div>
+        {(config.sendspinEnabled ?? false) && sendspinPanel}
+      </Stage>
+    </div>
+  );
+}
+
+// SendspinPairing: one Echo's player status, and the pairing token to paste
+// into Music Assistant (Settings → Players → the Echo → Pair with token). The
+// token is fetched from the Echo on request and never kept: it carries the
+// Echo's pairing key.
+function SendspinPairing({ deviceId, status, isAdmin }) {
+  const mono = "'DM Mono',monospace";
+  const [token, setToken] = useState(null);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const show = async () => {
+    setBusy(true); setError('');
+    try {
+      const r = await API.get(`/api/devices/${deviceId}/sendspin/token`);
+      setToken(r.token);
+    } catch (e) {
+      setError(e.error || e.message || 'Could not get the token');
+    } finally {
+      setBusy(false);
+    }
+  };
+  const copy = () => {
+    navigator.clipboard.writeText(token).then(() => setCopied(true)).catch(() => {});
+  };
+
+  let line = 'Starting';
+  if (status) {
+    switch (status.state) {
+      case 'listening': line = 'Waiting for Music Assistant'; break;
+      case 'connected': line = `Connected to ${status.server}`; break;
+      case 'playing':   line = status.group ? `Playing in ${status.group}` : 'Playing'; break;
+      case 'busy':      line = 'Home Assistant is playing, so it left its group'; break;
+      case 'error':     line = `Not running: ${status.error}`; break;
+      default:          line = status.state || 'Starting';
+    }
+    if ((status.state === 'connected' || status.state === 'playing') && !status.paired) line += ' · unpaired';
+  }
+  const paired = status && status.pairedWith > 0
+    ? `paired with ${status.pairedWith} server${status.pairedWith === 1 ? '' : 's'}` : 'not paired';
+
+  return (
+    <div style={{ fontFamily: mono, fontSize: 11, color: 'var(--text2)', display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div>{line} <span style={{ color: 'var(--muted)' }}>· {paired}</span></div>
+      {isAdmin && !token && (
+        <div><Pill small disabled={busy} onClick={show}>{busy ? 'Asking the Echo…' : 'Show pairing token'}</Pill></div>
+      )}
+      {token && (
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', minWidth: 0 }}>
+          <span style={{ wordBreak: 'break-all', userSelect: 'all' }}>{token}</span>
+          <Pill small onClick={copy}>{copied ? 'Copied' : 'Copy'}</Pill>
+          <Pill small onClick={() => { setToken(null); setCopied(false); }}>Hide</Pill>
+        </div>
+      )}
+      {token && <div style={{ color: 'var(--muted)', fontSize: 10 }}>In Music Assistant, pair this player with the token. Anyone with it can pair with this Echo.</div>}
+      {error && <div style={{ color: 'var(--error)' }}>{error}</div>}
     </div>
   );
 }

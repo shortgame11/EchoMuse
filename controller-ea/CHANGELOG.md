@@ -1,5 +1,61 @@
 # Changelog
 
+## 2.25.0
+
+Private listening, pairing from the Echo, and mute that works. Pair with firmware v2.17.0, which this controller offers.
+
+### New
+
+- **Private listening.** An Echo can detect its own wake word and send nothing until it hears it, then only what you say. Existing installs keep listening on the controller; to switch an Echo, set Config → Wake word → Wake word detection to "On this Echo". New installs start there. Needs firmware v2.17.0. Spec: docs/listening.md.
+- **Pairing replaces the Secure link button.** Hold an Echo's action button for 5 seconds and approve it on the dashboard; it gets its link credentials. Once an Echo has used them, a connection without them is refused, and the Echo's Link row says why. Older firmware is paired from the dashboard with **Pair**.
+- **Mute from Home Assistant and Music Assistant** silences the Echo, and unmute brings the volume back (#641).
+- **Wake sound.** An optional tone when an Echo hears its wake word, at its own level, for anyone who can't see the ring (#120). Needs firmware v2.17.0.
+- **One controller address for the whole fleet.** Config → Advanced sets an ordered list that the wizard writes and every Echo tries before mDNS (#647).
+
+### Improved
+
+- With several Echoes, the one that heard you first answers, judged by when each captured the wake word rather than when its message arrived (#639).
+- EQ, bass guard and limiter move onto the Echo when its firmware supports it, so a change is heard at once (#243).
+- "Speak while the reply is written" starts the answer at its first words instead of its last; off by default (#606).
+- Long answers no longer go silent for up to 2 seconds between sentences.
+- A wake with nobody speaking after it no longer sends background music to Home Assistant, which answered questions nobody asked.
+- Music Assistant resumes in about 2 seconds, down from 7.
+- Settings → System holds update checks, device approval, session expiry and the release repository, which had no controls before.
+- The dashboard's colours meet WCAG 2.2 AA in both themes (#652).
+- Before building emOS the wizard checks that the Echo's unlock, recovery, systems and kernels agree on one FireOS generation (#619).
+- Support bundles include each Echo's userspace and kernel (#626) and keep the line that records an announcement (#565).
+- Link loss is recorded per Echo from the kernel's TCP counters.
+
+### Fixed
+
+- The controller stalled every Echo's audio for up to 400ms on each wake it scored and on database writes (#658).
+- Two dashboard routes answered without signing in; they now require a session (#657).
+- Volume up on a muted Echo jumped to the button's floor; it now unmutes a step above where it was (#678).
+- Two Echoes could share a name, and names could hold control characters or no letter or number (#649, #650).
+- A device credentialed by the wizard showed as waiting for approval before it had ever connected (#453).
+- The Bluetooth proxy's seen and forwarded counts started from different moments (#410).
+- An Echo missing its wake word model moved to the controller's wake word; it now keeps its mode and answers the button.
+- Wizard steps could hide their own buttons (#676).
+- Playback helpers were left running after a turn (#659).
+
+### Known issues
+
+- Music can drop out when a voice turn ducks it (#671).
+- "Hey jarvis" wakes falsely over music.
+- A follow-up question can start with a pop in the recording (#682).
+
+### Thanks
+
+- @MikeFez for "Speak while the reply is written" (#606).
+- @costajohnt for keeping announcements in support bundles (#565).
+- @remy for asking for mute (#641), and @tvories for the wake sound (#120).
+- @evy0311 for the boot-loop report behind the wizard's new checks (#619).
+- @NicFragale, whose static endpoints (#166) the fleet address list builds on.
+
+**This release migrates the database (schema v25–v27).** A backup is written beside it first. An older controller will not start on the migrated database, so going back means restoring that backup.
+
+Soaked for 24 hours on four Echoes with no errors logged. [UAT report](https://github.com/wilbowes/EchoMuse/blob/main/docs/uat-results/2.25.0-ea.1.md).
+
 ## 2.25.0-ea.1 (Early Access)
 
 **Pairing replaces the Secure link button.** Hold an Echo's action button for

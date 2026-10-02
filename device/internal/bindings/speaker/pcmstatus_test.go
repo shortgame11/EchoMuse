@@ -81,6 +81,32 @@ func TestStatusPathMatchesTheDeviceWeOpen(t *testing.T) {
 	}
 }
 
+// Read off a real device's running stream (runningStatus, above).
+func TestPcmDelayReadsARunningStream(t *testing.T) {
+	if n, ok := pcmDelay(runningStatus); !ok || n != 8064 {
+		t.Errorf("got %d %v, want 8064 true", n, ok)
+	}
+	if _, ok := pcmDelay(heldStatus); ok {
+		t.Error("a PREPARED stream held by another process gave a delay")
+	}
+}
+
+// No delay is trusted from a stream that is not running, or one whose delay
+// cannot be read: Sendspin would schedule against a clock that is not there.
+func TestPcmDelayRefusesAnythingButARunningStream(t *testing.T) {
+	for name, status := range map[string]string{
+		"closed":   "closed\n",
+		"prepared": "state: PREPARED\ndelay       : 0\n",
+		"xrun":     "state: XRUN\ndelay       : 4096\n",
+		"no delay": "state: RUNNING\navail       : 879\n",
+		"garbage":  "state: RUNNING\ndelay       : lots\n",
+	} {
+		if _, ok := pcmDelay(status); ok {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
 func TestEachBoardOpensItsOwnSpeaker(t *testing.T) {
 	for _, c := range []struct {
 		b      *board.Board

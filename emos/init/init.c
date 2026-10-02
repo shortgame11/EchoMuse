@@ -1409,6 +1409,10 @@ static void write_resolv_conf(void)
  * ships no rules whatsoever, so this is emOS being stricter than the thing it
  * replaces rather than catching up to it.
  *
+ * A listener the user turns on opens its own port for as long as it runs:
+ * the firmware's Sendspin player does (device/internal/firewall), so an Echo
+ * with nothing enabled is still outbound-only.
+ *
  * Order matters: every ACCEPT is installed before the policy flips to DROP, so
  * the window where everything is dropped never exists. And it runs before
  * ifup, so the interface is never up without the policy.
@@ -1433,6 +1437,14 @@ static void write_resolv_conf(void)
  *
  * IPv6 gets the same treatment; ICMPv6 must be allowed or IPv6 cannot
  * function at all (neighbour discovery rides it).
+ *
+ * Where the IPv6 policy cannot be set, IPv6 is switched OFF. FireOS 6's
+ * system partition ships no ip6tables, so on every emOS device built beside
+ * it the loop's ip6tables half failed and wlan0 took inbound IPv6 unfiltered
+ * (15LE, 2026-09-30; FireOS 5's system has it and C95 was filtered). Nothing
+ * here uses IPv6 — the controller link and mDNS both run over IPv4 — so an
+ * unfilterable stack is removed rather than left open. `default` covers
+ * wlan0, which the WiFi driver may not have created yet.
  */
 static void firewall(void)
 {
@@ -1447,7 +1459,11 @@ static void firewall(void)
         "done; "
         "iptables -I INPUT 4 -p udp --sport 67 --dport 68 -j ACCEPT; "
         "iptables -I INPUT 5 -p icmp -j ACCEPT; "
-        "ip6tables -I INPUT 4 -p icmpv6 -j ACCEPT", NULL };
+        "ip6tables -I INPUT 4 -p icmpv6 -j ACCEPT; "
+        "if ! ip6tables -S INPUT 2>/dev/null | grep -q '^-P INPUT DROP'; then "
+        "  for f in /proc/sys/net/ipv6/conf/*/disable_ipv6; do echo 1 > $f; done; "
+        "  echo 'ipv6 disabled: no ip6tables policy'; "
+        "fi", NULL };
     int st = run_wait(fw);
     netlog("firewall applied status=%d\n", st);
 }

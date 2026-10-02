@@ -232,6 +232,14 @@ DEFAULT_DEVICE_CONFIG = {
     # Android Bluetooth stack on the device (required — /dev/stpbt is
     # single-owner) and brings up a second ESPHome listener + mDNS entry.
     "bleProxyEnabled":  False,
+    # sendspinEnabled: the device runs a Sendspin player (#89) that Music
+    # Assistant connects to directly for synchronised multi-room audio.
+    # Default off: it opens a listening port and an mDNS record on the Echo.
+    # sendspinUnpaired lets a server the MA operator approved play without
+    # pairing; off by default, since pairing is one paste of the device's
+    # token and without it anyone on the LAN can claim to be a server.
+    "sendspinEnabled":  False,
+    "sendspinUnpaired": False,
     # beamformingEnabled: True — ch6 (centre/omni) hears the wake word, then
     # the turn locks to the best perimeter mic. The flag ONLY gates Lock():
     # unlocked is always ch6 and the wake path never locks, so the wake
@@ -1036,6 +1044,40 @@ MIGRATIONS: list[str] = [
 
     UPDATE system_config SET value = '27' WHERE key = 'schema_version';
     """,
+    # v28 — boot-time health. One row per BOOT for how it started, keyed on
+    # the kernel's boot_id because a device re-registers on every redial; and
+    # one row per device per DAY for the eMMC's own wear report (JEDEC
+    # EXT_CSD), because a device can run for months without rebooting and a
+    # value that steps once every few years is only readable as a history.
+    # Every reading is NULLABLE: firmware that sends none, a FireOS 6 kernel
+    # whose cmdline has lost the boot reason, and a part below EXT_CSD rev 7
+    # must not read as a healthy zero.
+    """
+    CREATE TABLE IF NOT EXISTS device_boots (
+        device_id     TEXT    NOT NULL REFERENCES devices(device_id),
+        boot_id       TEXT    NOT NULL,
+        first_seen    INTEGER NOT NULL,
+        firmware_ver  TEXT,
+        boot_reason   TEXT,
+        PRIMARY KEY (device_id, boot_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS device_wear (
+        device_id     TEXT    NOT NULL REFERENCES devices(device_id),
+        day           TEXT    NOT NULL,
+        updated_at    INTEGER NOT NULL,
+        emmc_rev      INTEGER,
+        emmc_pre_eol  INTEGER,
+        emmc_life_a   INTEGER,
+        emmc_life_b   INTEGER,
+        emmc_name     TEXT,
+        emmc_date     TEXT,
+        emmc_manfid   TEXT,
+        PRIMARY KEY (device_id, day)
+    );
+
+    UPDATE system_config SET value = '28' WHERE key = 'schema_version';
+    """,
 ]
 
 # Post-migration fixups that need Python rather than SQL. Keyed by the schema
@@ -1664,6 +1706,57 @@ def set_device_kernel(device_id: str, arch: str, release: str) -> None:
         )
 
 
+def record_boot(device_id: str, boot_id: str, firmware_ver: Optional[str],
+                boot_reason: Optional[str]) -> None:
+    """
+    Record a boot from its register message, once: later registrations in the
+    same boot (every redial) are ignored, so the row keeps the first reading.
+    """
+    with _tx() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO device_boots
+               (device_id, boot_id, first_seen, firmware_ver, boot_reason)
+               VALUES (?, ?, ?, ?, ?)""",
+            (device_id, boot_id, int(time.time()), firmware_ver, boot_reason or None),
+        )
+
+
+def record_wear(device_id: str, day: str, values: tuple) -> None:
+    """Upsert the day's eMMC reading: the latest reading of the day wins."""
+    with _tx() as conn:
+        conn.execute(
+            """INSERT INTO device_wear
+               (device_id, day, updated_at, emmc_rev, emmc_pre_eol, emmc_life_a,
+                emmc_life_b, emmc_name, emmc_date, emmc_manfid)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(device_id, day) DO UPDATE SET
+                 updated_at = excluded.updated_at,
+                 emmc_rev = excluded.emmc_rev, emmc_pre_eol = excluded.emmc_pre_eol,
+                 emmc_life_a = excluded.emmc_life_a, emmc_life_b = excluded.emmc_life_b,
+                 emmc_name = excluded.emmc_name, emmc_date = excluded.emmc_date,
+                 emmc_manfid = excluded.emmc_manfid""",
+            (device_id, day, int(time.time()), *values),
+        )
+
+
+def latest_health() -> dict[str, dict]:
+    """Each device's latest boot and latest wear reading merged into one dict,
+    keyed by device_id: one pass for the device list, not a query per device."""
+    out: dict[str, dict] = {}
+    for r in _q("""SELECT b.device_id, b.first_seen AS boot_at, b.boot_reason, b.firmware_ver
+                   FROM device_boots b
+                   JOIN (SELECT device_id, MAX(first_seen) AS t FROM device_boots
+                         GROUP BY device_id) m
+                     ON b.device_id = m.device_id AND b.first_seen = m.t"""):
+        out.setdefault(r["device_id"], {}).update(dict(r))
+    for r in _q("""SELECT w.* FROM device_wear w
+                   JOIN (SELECT device_id, MAX(day) AS d FROM device_wear
+                         GROUP BY device_id) m
+                     ON w.device_id = m.device_id AND w.day = m.d"""):
+        out.setdefault(r["device_id"], {}).update(dict(r))
+    return out
+
+
 def fleet_base_os() -> set[str]:
     """
     Every base_os the fleet has reported, as a set.
@@ -1936,6 +2029,8 @@ def delete_device(device_id: str) -> None:
     """
     with _tx() as conn:
         conn.execute("DELETE FROM device_logs WHERE device_id = ?", (device_id,))
+        conn.execute("DELETE FROM device_boots WHERE device_id = ?", (device_id,))
+        conn.execute("DELETE FROM device_wear WHERE device_id = ?", (device_id,))
         conn.execute("DELETE FROM devices WHERE device_id = ?", (device_id,))
     try:
         removed = em_recordings.delete_device(device_id)
