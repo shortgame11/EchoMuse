@@ -291,15 +291,17 @@ index e95dc48..ea334cb 100644
 +  say "  disabled: $marker"
 +}
 +
-+say "1/5 Alexa start triggers"
-+comment_block "$INIT_DIR/init.smarthomed.rc"  "com.amazon.puffin.PUFFIN_START"
-+comment_block "$INIT_DIR/init.commsd.rc"      "audio_mixer.init=true"
++say "1/5 Alexa start triggers (preserving Amazon mixer initialization)"
++# Dot 3 mic capture requires the stock mixer service and all audio_mixer.init
++# actions. The controlled A/B test showed that disabling these triggers leaves
++# EchoMuse with digital silence, so these three files stay stock.
 +comment_block "$INIT_DIR/init.ama_server.rc"  "kvs_init_completed"
 +comment_block "$INIT_DIR/init.oobe.puffin.rc" "com.amazon.puffin.OOBE_SETUP"
 +comment_block "$INIT_DIR/init.oobe.puffin.rc" "OOBED_START=on_boot"
 +comment_block "$INIT_DIR/init.oobe.puffin.rc" "OOBED_START=on_button_press"
 +comment_block "$INIT_DIR/init.oobe.puffin.rc" "OOBED_START=on_network_disconnect"
-+comment_block "$MNT/init.mt8516.rc"           "com.amazon.puffin.PUFFIN_START=1 && property:audio_mixer.init=true"
++# Keep /init.mt8516.rc stock too: its mixer start and audio_mixer.init
++# trigger are part of the working Dot 3 capture path.
 +
 +say "2/5 WiFi + DHCP at boot"
 +CONN="$MNT/init.connectivity.rc"

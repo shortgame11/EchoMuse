@@ -541,6 +541,20 @@ def test_the_wake_word_asset_wizard_step_is_mandatory():
         "the push must verify md5 and fail loudly — a truncated file fails later at dlopen"
 
 
+def test_dot3_installer_preserves_amazon_mixer_initialization():
+    """The Dot 3 mic path needs Amazon's stock mixer-init triggers."""
+    from pathlib import Path
+    jsx = (Path(__file__).resolve().parent.parent / "static" / "dashboard.jsx").read_text()
+    setup = jsx[jsx.index("const _DONUT_SETUP_SCRIPT"):]
+    setup = setup[:setup.index("\n`;", setup.index("String.raw`"))]
+
+    assert 'comment_block "$INIT_DIR/init.smarthomed.rc"  "com.amazon.puffin.PUFFIN_START"' not in setup
+    assert 'comment_block "$INIT_DIR/init.commsd.rc"      "audio_mixer.init=true"' not in setup
+    assert 'comment_block "$MNT/init.mt8516.rc"           "com.amazon.puffin.PUFFIN_START=1 && property:audio_mixer.init=true"' not in setup
+    assert 'service mixer /system/bin/mixer' not in setup
+    assert "preserving Amazon mixer initialization" in setup
+
+
 def test_turn_end_reports_real_media_state_not_a_hardcoded_idle():
     """
     Issue #53: "the esphome media player reports that it is idle even though
